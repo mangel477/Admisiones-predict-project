@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-08-20
+
+### Added
+
+- Datos brutos de admisiones y documentación de datos de soporte.
+- Un notebook para entender el problema de predicción de admisiones.
+- Un notebook de exploración inicial de datos de admisiones y un conjunto de datos intermedio en Parquet con tipos corregidos para análisis posteriores.
+- Un notebook de análisis exploratorio de datos univariado para caracterizar el conjunto de datos de admisiones.
+
 ### [0.1.0] - 2026-08-15
 
 ### Added
