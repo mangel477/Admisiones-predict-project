@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Datos intermedios de admisiones con tipos corregidos en formato Parquet para análisis posterior.
 - Un notebook de análisis exploratorio univariante para caracterizar el conjunto de datos de admisiones.
 - Un notebook de análisis exploratorio bivariable que documenta asociaciones entre la probabilidad de admisión, sus predictores y `Research`.
+- Se amplió el análisis exploratorio multivariable con asociaciones condicionadas, diagnóstico de multicolinealidad, perfiles conjuntos y una baseline heurística transparente para preparar su validación posterior.
 
 ## [0.2.0] - 2026-08-20
 
