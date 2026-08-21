@@ -9,3 +9,4 @@ Maintain `CHANGELOG.md` as the user-facing record of meaningful project changes.
 - Move entries from `Unreleased` only for an explicit release. Use a valid Semantic Version and its real release date.
 - Keep newest release sections first and preserve stable Markdown headings and link references.
 - Never invent facts, versions, dates, repository links, comparison links, capabilities, or verification outcomes.
+- always write in spanish for the changelog.
