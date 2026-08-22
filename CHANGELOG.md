@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Un notebook de análisis exploratorio univariante para caracterizar el conjunto de datos de admisiones.
 - Un notebook de análisis exploratorio bivariable que documenta asociaciones entre la probabilidad de admisión, sus predictores y `Research`.
 - Se amplió el análisis exploratorio multivariable con asociaciones condicionadas, diagnóstico de multicolinealidad, perfiles conjuntos y una baseline heurística transparente para preparar su validación posterior.
+- Un notebook de ingeniería de atributos que construye la preparación de datos con `Pipeline` y `ColumnTransformer` de scikit-learn: elimina registros duplicados, imputa valores faltantes, codifica la variable binaria `Research`, estandariza los predictores numéricos y produce la partición estratificada de entrenamiento y prueba lista para el modelado. Documenta además por qué no se aplicaron la discretización, las transformaciones no lineales ni la selección de atributos.
 
 ### Changed
 
