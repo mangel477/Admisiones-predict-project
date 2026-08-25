@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Un notebook de modelo base que establece la referencia contra la que se compararán los modelos de machine learning: reutiliza el pipeline de preparación, replica la misma partición de entrenamiento y prueba, e implementa `ModeloBase`, una heurística sobre `CGPA` con la interfaz de estimador de scikit-learn. Se evalúa con MAE, RMSE y R² frente a modelos `Dummy` de media y mediana.
+- Auditoría de duplicados posterior a la transformación de datos, que documenta la fuga de información detectada entre las particiones de entrenamiento y prueba y cuantifica los registros repetidos ocultos tras valores faltantes.
+- Validación cruzada del modelo base con diez particiones y curvas de aprendizaje, escalabilidad, dispersión entre particiones y distribución del error, con el preprocesamiento encadenado en el pipeline para que se reajuste en cada partición.
+- Selección justificada del predictor del modelo base a partir de su asociación con el objetivo, con verificación empírica del desempeño de cada variable candidata.
+- Recomendaciones para construir el modelo de machine learning a partir de los resultados del modelo base.
+
+### Fixed
+
+- El codificador de la variable `Research` fallaba al reajustarse sobre subconjuntos sin valores faltantes y transformar después datos que sí los contenían; ahora los trata como desconocidos y los deriva al imputador.
+
 ## [0.3.0] - 2026-08-21
 
 ### Added
