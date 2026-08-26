@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Un notebook de selección de modelos que evalúa ocho familias de regresión sobre el mismo pipeline de preparación, descarta las que rinden por debajo del promedio, compara las restantes con validación cruzada y una prueba estadística que corrige el solapamiento entre particiones, y optimiza los hiperparámetros de las tres mejores. El modelo seleccionado, una regresión Ridge, reduce el error medio de predicción un 32% respecto del modelo base.
+- El pipeline de preprocesamiento y modelo entrenado se almacena en `models/modelo-seleccion-admisiones.joblib`, con verificación de que el artefacto recargado reproduce las mismas predicciones.
+
 ### Fixed
 
 - La deduplicación no detectaba registros repetidos que solo diferían en la posición de un valor faltante, porque un nulo nunca se considera igual a otro. Al imputar, esas filas quedaban idénticas y un mismo registro podía repartirse entre entrenamiento y prueba, filtrando información hacia la evaluación. Ahora se comparan las filas por compatibilidad en las columnas observadas: el conjunto pasa de 471 a 400 registros distintos, desaparecen los valores faltantes —estaban íntegramente en las copias— y la verificación posterior a la transformación no encuentra duplicados ni solapamiento entre particiones.
