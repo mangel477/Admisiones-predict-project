@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- La deduplicación no detectaba registros repetidos que solo diferían en la posición de un valor faltante, porque un nulo nunca se considera igual a otro. Al imputar, esas filas quedaban idénticas y un mismo registro podía repartirse entre entrenamiento y prueba, filtrando información hacia la evaluación. Ahora se comparan las filas por compatibilidad en las columnas observadas: el conjunto pasa de 471 a 400 registros distintos, desaparecen los valores faltantes —estaban íntegramente en las copias— y la verificación posterior a la transformación no encuentra duplicados ni solapamiento entre particiones.
+
+### Changed
+
+- Los notebooks de ingeniería de atributos y de modelo base recalculan sus resultados sobre los 400 registros distintos: la partición pasa a 320 filas de entrenamiento y 80 de prueba, y las métricas del modelo base ganan estabilidad, con la desviación del R² entre particiones reducida a la mitad.
+
 ### Added
 
 - Un notebook de modelo base que establece la referencia contra la que se compararán los modelos de machine learning: reutiliza el pipeline de preparación, replica la misma partición de entrenamiento y prueba, e implementa `ModeloBase`, una heurística sobre `CGPA` con la interfaz de estimador de scikit-learn. Se evalúa con MAE, RMSE y R² frente a modelos `Dummy` de media y mediana.
