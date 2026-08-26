@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Un notebook de interpretación del modelo que carga el artefacto entregado sin reentrenarlo, identifica los atributos más influyentes mediante coeficientes e importancia por permutación, y caracteriza los errores que comete. El diagnóstico muestra que el error se concentra en el quintil de menor probabilidad real, donde el modelo sobreestima de forma sistemática, y descarta con evidencia que la causa sean valores atípicos, errores de ingreso, la codificación, la regularización o la familia del modelo.
+- Un listado de diez pruebas y experimentos para la siguiente iteración, derivados del diagnóstico de errores.
+
+### Added
+
 - Un notebook de selección de modelos que evalúa ocho familias de regresión sobre el mismo pipeline de preparación, descarta las que rinden por debajo del promedio, compara las restantes con validación cruzada y una prueba estadística que corrige el solapamiento entre particiones, y optimiza los hiperparámetros de las tres mejores. El modelo seleccionado, una regresión Ridge, reduce el error medio de predicción un 32% respecto del modelo base.
 - El pipeline de preprocesamiento y modelo entrenado se almacena en `models/modelo-seleccion-admisiones.joblib`, con verificación de que el artefacto recargado reproduce las mismas predicciones.
 
