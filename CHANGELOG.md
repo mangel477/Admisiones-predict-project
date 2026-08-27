@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Instrucciones de ejecución de la demostración en el README.
 - Las dependencias de ejecución del proyecto quedan declaradas en `pyproject.toml`: hasta ahora estaban instaladas a mano y quien clonara el repositorio no podía ejecutar la aplicación.
 
+### Fixed
+
+- Las herramientas necesarias para ejecutar los notebooks quedan declaradas como dependencias de desarrollo. Faltaban Jupyter, matplotlib y seaborn, que estaban instalados a mano en el entorno local: quien clonara el repositorio y sincronizara el entorno no podía abrir ni ejecutar ningún notebook, y quien ya los tuviera instalados los perdía al sincronizar, porque el comando elimina lo que no está declarado.
+
 ## [0.4.0] - 2026-08-26
 
 ### Added
