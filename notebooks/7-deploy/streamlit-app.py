@@ -244,6 +244,9 @@ def normalizar_columnas(lote: pd.DataFrame) -> pd.DataFrame:
     the trailing space the training data carries. Matching case-insensitively and
     ignoring surrounding whitespace turns a guaranteed failure into a non-issue.
     """
+    normalizadas = [str(columna).strip().lower() for columna in lote.columns]
+    if len(normalizadas) != len(set(normalizadas)):
+        raise ValueError("Hay columnas que colisionan después de normalizar sus nombres.")
     canonicas = {columna.strip().lower(): columna for columna in COLUMNAS_MODELO}
     renombres = {
         columna: canonicas[str(columna).strip().lower()]
