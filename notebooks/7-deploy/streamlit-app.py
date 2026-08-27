@@ -365,7 +365,7 @@ def pestana_lote(modelo: Pipeline) -> None:
 
     try:
         lote = pd.read_csv(StringIO(archivo.getvalue().decode("utf-8")))
-    except (UnicodeDecodeError, pd.errors.ParserError) as error:
+    except (UnicodeDecodeError, pd.errors.ParserError, pd.errors.EmptyDataError) as error:
         st.error(f"No se pudo leer el archivo: {error}")
         return
 
