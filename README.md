@@ -74,6 +74,57 @@ Example to install [plotly](https://plotly.com/python/) in dev group:
 uv add --group dev plotly
 ```
 
+## 🎓 Demo: admission prediction
+
+A web form that feeds the trained pipeline (`models/modelo-seleccion-admisiones.joblib`) and returns
+the estimated probability of admission for a candidate. The interface is in Spanish because it is
+aimed at the applicants themselves.
+
+### Run it locally
+
+```bash
+uv sync
+uv run streamlit run notebooks/7-deploy/streamlit-app.py
+```
+
+The app opens at <http://localhost:8501>. No further setup is needed: the model artifact is
+versioned in the repository and the app resolves its path from the project root, so it can be
+started from any directory.
+
+To run it on a different port, or headless on a server:
+
+```bash
+uv run streamlit run notebooks/7-deploy/streamlit-app.py --server.port 8080 --server.headless true
+```
+
+### Two ways to enter data
+
+The app has two tabs. **Un candidato** is the form described below. **Carga masiva** takes a CSV with
+one candidate per row and returns every prediction at once, with a downloadable template, a per-row
+breakdown of the same caveats, and a results file to download.
+
+Column names in the uploaded file are matched case-insensitively and ignoring surrounding
+whitespace, and the research column accepts `1/0`, `true/false` or `si/no`. A file written by hand
+would otherwise fail on the trailing space that `LOR ` carries in the training data.
+
+### What the form does
+
+Seven inputs — GRE, TOEFL, CGPA, university rating, statement of purpose, letters of recommendation
+and research experience — are assembled into a single-row DataFrame whose column names match the
+training data exactly, trailing spaces included. The pipeline applies the same imputation, encoding
+and scaling learned during training, and the Ridge regression returns the estimate.
+
+Beyond the number, the app reports what the model does **not** know:
+
+- **Out-of-range inputs.** A linear model does not refuse to extrapolate; it keeps applying the same
+  slope beyond the data it saw and can return impossible probabilities. Values outside the observed
+  training range are flagged, and the displayed probability is clamped to `[0, 1]`.
+- **Systematic overestimation at the low end.** The interpretation stage found the model overestimates
+  candidates with low real probability by about 9 percentage points. Estimates below 60% are marked
+  as unreliable.
+- **Attribute contributions.** Since the model is linear, the prediction decomposes exactly into
+  intercept plus coefficient times standardized value. The app shows that breakdown.
+
 ## 🗃️ Project structure
 
 - [Data structure]

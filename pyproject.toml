@@ -3,13 +3,14 @@ name = "template-data-science-container"
 version = "0.1.0"
 description = "Template for data science and AI Projects with the last stable version of python and devcontainer"
 authors = [
-    "Jose R. Zapata <joserzapata.github.io>",
+    "Miguel Toro <mangel477>",
 ]
 requires-python = ">=3.12"
 readme = "README.md"
 
 dependencies = [
-
+    "scikit-learn>=1.9.0",
+    "streamlit>=1.62.0",
 ]
 
 [project.urls]
