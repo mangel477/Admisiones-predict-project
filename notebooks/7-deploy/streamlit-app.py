@@ -223,8 +223,8 @@ def mostrar_contribuciones(modelo: Pipeline, datos: pd.DataFrame) -> None:
     transformado = preprocesador.transform(datos)
     contribuciones = pd.DataFrame(
         {
-            "contribución": regresor.coef_ * transformado.to_numpy()[0],
-            "valor estandarizado": transformado.to_numpy()[0],
+            "contribución": regresor.coef_ * transformado[0],
+            "valor estandarizado": transformado[0],
         },
         index=[nombre.split("__", 1)[1] for nombre in preprocesador.get_feature_names_out()],
     ).sort_values("contribución", key=abs, ascending=False)
