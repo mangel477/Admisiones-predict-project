@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-26
+
 ### Added
 
 - Un notebook de interpretación del modelo que carga el artefacto entregado sin reentrenarlo, identifica los atributos más influyentes mediante coeficientes e importancia por permutación, y caracteriza los errores que comete. El diagnóstico muestra que el error se concentra en el quintil de menor probabilidad real, donde el modelo sobreestima de forma sistemática, y descarta con evidencia que la causa sean valores atípicos, errores de ingreso, la codificación, la regularización o la familia del modelo.
