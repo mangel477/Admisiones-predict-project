@@ -8,9 +8,11 @@ The app loads the pipeline selected in the model selection stage
 from the data entered in the form.
 """
 
+from io import StringIO
 from pathlib import Path
 from typing import cast
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 from joblib import load
@@ -38,6 +40,21 @@ RANGOS_ENTRENAMIENTO: dict[str, tuple[float, float]] = {
     COLUMNA_LOR: (1.0, 5.0),
     "CGPA": (6.80, 9.92),
 }
+
+# exact order and naming the pipeline expects
+COLUMNAS_MODELO = [
+    "GRE Score",
+    "TOEFL Score",
+    "University Rating",
+    "SOP",
+    COLUMNA_LOR,
+    "CGPA",
+    "Research",
+]
+
+# values accepted for the boolean column when the file is written by hand
+VALORES_VERDADEROS = {"1", "true", "yes", "y", "si", "sí", "verdadero"}
+VALORES_FALSOS = {"0", "false", "no", "n", "falso"}
 
 
 def encontrar_raiz_del_proyecto() -> Path:
@@ -220,8 +237,197 @@ def mostrar_contribuciones(modelo: Pipeline, datos: pd.DataFrame) -> None:
     st.dataframe(contribuciones.round(4), width="stretch")
 
 
+def normalizar_columnas(lote: pd.DataFrame) -> pd.DataFrame:
+    """Map the uploaded column names to the exact ones the pipeline expects.
+
+    A file written by hand will almost certainly spell the column `LOR` without
+    the trailing space the training data carries. Matching case-insensitively and
+    ignoring surrounding whitespace turns a guaranteed failure into a non-issue.
+    """
+    canonicas = {columna.strip().lower(): columna for columna in COLUMNAS_MODELO}
+    renombres = {
+        columna: canonicas[str(columna).strip().lower()]
+        for columna in lote.columns
+        if str(columna).strip().lower() in canonicas
+    }
+    return lote.rename(columns=renombres)
+
+
+def convertir_research(valores: pd.Series) -> pd.Series:
+    """Turn the research column into booleans, accepting the usual spellings.
+
+    A spreadsheet may hold 1/0, True/False or si/no depending on who filled it in.
+    """
+    if valores.dtype == bool:
+        return valores
+    texto = valores.astype(str).str.strip().str.lower()
+    convertido = texto.map(
+        lambda valor: (
+            True if valor in VALORES_VERDADEROS else (False if valor in VALORES_FALSOS else None)
+        )
+    )
+    return convertido.astype("boolean")
+
+
+def preparar_lote(lote: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """Normalize the uploaded frame and report the columns that are missing."""
+    normalizado = normalizar_columnas(lote)
+    faltantes = [columna for columna in COLUMNAS_MODELO if columna not in normalizado.columns]
+    if faltantes:
+        return normalizado, faltantes
+
+    preparado = normalizado[COLUMNAS_MODELO].copy()
+    preparado["Research"] = convertir_research(preparado["Research"])
+    for columna in COLUMNAS_MODELO[:-1]:
+        preparado[columna] = pd.to_numeric(preparado[columna], errors="coerce")
+    return preparado, []
+
+
+def evaluar_lote(modelo: Pipeline, lote: pd.DataFrame) -> pd.DataFrame:
+    """Predict every row and attach the same caveats the single form reports."""
+    crudas = modelo.predict(lote)
+    acotadas = np.clip(crudas, 0.0, 1.0)
+
+    fuera_de_rango = pd.Series(False, index=lote.index)
+    for atributo, (minimo, maximo) in RANGOS_ENTRENAMIENTO.items():
+        valores = pd.to_numeric(lote[atributo], errors="coerce")
+        fuera_de_rango |= (valores < minimo) | (valores > maximo)
+
+    return lote.assign(
+        **{
+            "probabilidad (%)": (acotadas * 100).round(1),
+            "acotada": crudas != acotadas,
+            "fuera de rango": fuera_de_rango.to_numpy(),
+            "poco fiable": acotadas < UMBRAL_CONFIANZA,
+        }
+    )
+
+
+def plantilla_csv() -> str:
+    """Build a small example file so the expected format is unambiguous."""
+    ejemplo = pd.DataFrame(
+        [
+            [316, 107, 3, 3.5, 3.5, 8.56, True],
+            [340, 120, 5, 5.0, 4.5, 9.80, True],
+            [295, 95, 2, 2.0, 2.5, 7.40, False],
+        ],
+        columns=COLUMNAS_MODELO,
+    )
+    return cast(str, ejemplo.to_csv(index=False))
+
+
+def mostrar_resumen_lote(resultados: pd.DataFrame) -> None:
+    """Summarize how many rows carry each caveat before showing the table."""
+    col_a, col_b, col_c, col_d = st.columns(4)
+    col_a.metric("Candidatos", len(resultados))
+    col_b.metric("Probabilidad media", f"{resultados['probabilidad (%)'].mean():.1f} %")
+    col_c.metric("Poco fiables", int(resultados["poco fiable"].sum()))
+    col_d.metric("Fuera de rango", int(resultados["fuera de rango"].sum()))
+
+    if resultados["acotada"].any():
+        st.error(
+            f"{int(resultados['acotada'].sum())} fila(s) produjeron una probabilidad fuera de "
+            f"[0, 1] y se muestran acotadas. Ocurre cuando el perfil queda lejos del rango con el "
+            f"que se entrenó el modelo."
+        )
+    if resultados["fuera de rango"].any():
+        st.warning(
+            f"{int(resultados['fuera de rango'].sum())} fila(s) contienen algún valor fuera del "
+            f"rango observado en entrenamiento. En esas filas el modelo extrapola."
+        )
+    if resultados["poco fiable"].any():
+        st.warning(
+            f"{int(resultados['poco fiable'].sum())} fila(s) quedaron por debajo del "
+            f"{UMBRAL_CONFIANZA * 100:.0f} %, donde el modelo sobreestima de forma sistemática."
+        )
+
+
+def pestana_lote(modelo: Pipeline) -> None:
+    """Render the batch tab: upload a file, predict every row, download results."""
+    st.markdown(
+        "Cargue un archivo CSV con un candidato por fila para obtener todas las predicciones de "
+        "una sola vez. Los nombres de columna se reconocen sin distinguir mayúsculas ni espacios."
+    )
+
+    st.download_button(
+        label="Descargar plantilla de ejemplo",
+        data=plantilla_csv(),
+        file_name="plantilla-admisiones.csv",
+        mime="text/csv",
+    )
+
+    archivo = st.file_uploader("Archivo CSV", type=["csv"])
+    if archivo is None:
+        st.caption(
+            f"Columnas requeridas: {', '.join(columna.strip() for columna in COLUMNAS_MODELO)}"
+        )
+        return
+
+    try:
+        lote = pd.read_csv(StringIO(archivo.getvalue().decode("utf-8")))
+    except (UnicodeDecodeError, pd.errors.ParserError) as error:
+        st.error(f"No se pudo leer el archivo: {error}")
+        return
+
+    preparado, faltantes = preparar_lote(lote)
+    if faltantes:
+        st.error(
+            "Faltan columnas obligatorias: "
+            + ", ".join(columna.strip() for columna in faltantes)
+            + ". Descargue la plantilla para ver el formato esperado."
+        )
+        return
+
+    incompletas = int(preparado.isna().any(axis=1).sum())
+    if incompletas:
+        st.warning(
+            f"{incompletas} fila(s) tienen valores vacíos o no numéricos y se descartan. El modelo "
+            f"puede imputarlos, pero en una carga masiva un dato ilegible suele ser un error de "
+            f"formato, no un dato ausente."
+        )
+        preparado = preparado.dropna()
+
+    if preparado.empty:
+        st.error("No quedó ninguna fila utilizable.")
+        return
+
+    resultados = evaluar_lote(modelo, preparado)
+
+    st.divider()
+    mostrar_resumen_lote(resultados)
+    st.dataframe(resultados, width="stretch")
+
+    st.download_button(
+        label="Descargar resultados",
+        data=cast(str, resultados.to_csv(index=False)),
+        file_name="predicciones-admisiones.csv",
+        mime="text/csv",
+    )
+
+
+def pestana_formulario(modelo: Pipeline) -> None:
+    """Render the single-candidate tab."""
+    with st.form("formulario_admision"):
+        datos = obtener_datos_del_usuario()
+        enviado = st.form_submit_button("Calcular probabilidad", width="stretch")
+
+    if not enviado:
+        return
+
+    probabilidad = float(modelo.predict(datos)[0])
+
+    st.divider()
+    mostrar_prediccion(probabilidad, detectar_extrapolacion(datos))
+
+    with st.expander("¿Por qué esta predicción?"):
+        mostrar_contribuciones(modelo, datos)
+
+    with st.expander("Datos enviados al modelo"):
+        st.dataframe(datos, width="stretch")
+
+
 def main() -> None:
-    """Draw the page and run the prediction when the form is submitted."""
+    """Draw the page with both entry modes: single candidate and batch upload."""
     st.set_page_config(page_title="Predicción de admisión", page_icon="🎓", layout="centered")
 
     st.title("🎓 Predicción de admisión a posgrado")
@@ -236,21 +442,13 @@ def main() -> None:
         st.error(str(error))
         st.stop()
 
-    with st.form("formulario_admision"):
-        datos = obtener_datos_del_usuario()
-        enviado = st.form_submit_button("Calcular probabilidad", width="stretch")
+    pestana_individual, pestana_masiva = st.tabs(["Un candidato", "Carga masiva"])
 
-    if enviado:
-        probabilidad = float(modelo.predict(datos)[0])
+    with pestana_individual:
+        pestana_formulario(modelo)
 
-        st.divider()
-        mostrar_prediccion(probabilidad, detectar_extrapolacion(datos))
-
-        with st.expander("¿Por qué esta predicción?"):
-            mostrar_contribuciones(modelo, datos)
-
-        with st.expander("Datos enviados al modelo"):
-            st.dataframe(datos, width="stretch")
+    with pestana_masiva:
+        pestana_lote(modelo)
 
     with st.expander("Sobre el modelo y sus límites"):
         st.markdown(
