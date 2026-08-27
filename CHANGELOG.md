@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Una demostración web del modelo, construida con Streamlit, donde se ingresan los datos de un candidato y se obtiene su probabilidad estimada de admisión. La interfaz advierte cuando los datos quedan fuera del rango con el que el modelo fue entrenado, acota las probabilidades imposibles que puede devolver una regresión lineal, señala las estimaciones bajas como poco fiables por la sobreestimación detectada en el análisis de interpretación, y desglosa la contribución de cada atributo a la predicción.
+- Instrucciones de ejecución de la demostración en el README.
+- Las dependencias de ejecución del proyecto quedan declaradas en `pyproject.toml`: hasta ahora estaban instaladas a mano y quien clonara el repositorio no podía ejecutar la aplicación.
+
 ## [0.4.0] - 2026-08-26
 
 ### Added
