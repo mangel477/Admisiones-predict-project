@@ -97,6 +97,16 @@ To run it on a different port, or headless on a server:
 uv run streamlit run notebooks/7-deploy/streamlit-app.py --server.port 8080 --server.headless true
 ```
 
+### Two ways to enter data
+
+The app has two tabs. **Un candidato** is the form described below. **Carga masiva** takes a CSV with
+one candidate per row and returns every prediction at once, with a downloadable template, a per-row
+breakdown of the same caveats, and a results file to download.
+
+Column names in the uploaded file are matched case-insensitively and ignoring surrounding
+whitespace, and the research column accepts `1/0`, `true/false` or `si/no`. A file written by hand
+would otherwise fail on the trailing space that `LOR ` carries in the training data.
+
 ### What the form does
 
 Seven inputs — GRE, TOEFL, CGPA, university rating, statement of purpose, letters of recommendation
