@@ -6,10 +6,12 @@ permissions:
 
 jobs:
   dependency-review:
+    # Dependency review requires GitHub Advanced Security, only available on public repositories
+    if: github.event.repository.private != true
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
       - name: 'Dependency Review'
-        uses: actions/dependency-review-action@v4
+        uses: actions/dependency-review-action@v5.0.0
         continue-on-error: true
