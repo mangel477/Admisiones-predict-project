@@ -1,8 +1,13 @@
 """Feature pipeline for the graduate admissions prediction project.
 
-Reads the immutable raw dataset, applies the model-independent transformations
-defined in the exploration and feature-engineering notebooks, and stores the
+The stages run in this order: extract the immutable raw dataset, validate it
+against the contract of the source, apply the model-independent transformations
+defined in the exploration and feature-engineering notebooks, and store the
 resulting reusable feature table in the feature layer.
+
+Validation sits right after extraction, at the boundary where data enters the
+system, so a broken source fails where its cause is. Because the gate runs
+before any transformation, a failure aborts the run and nothing is persisted.
 
 Only model-independent transformations belong here (typing and deduplication).
 Imputation, scaling and encoding are model-dependent: they are parameterized by
@@ -22,6 +27,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pandera.pandas as pa
+from pandera.errors import SchemaErrors
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +50,85 @@ EXPECTED_COLUMNS = [*FEATURE_COLUMNS, TARGET_COLUMN]
 RAW_RELATIVE_PATH = Path("data/01_raw/Admission_Predict.csv")
 FEATURE_RELATIVE_PATH = Path("data/04_feature/admisiones_features.parquet")
 
+# Validation contract of the raw layer.
+#
+# The bounds are the ones documented in ``data/01_raw/Informacion.txt``, not the
+# ones observed in the sample. An observed range is a property of the sample, not
+# a rule of the domain: checking new data against it belongs to drift monitoring
+# at serving time, and the Streamlit demo already does that.
+#
+# Date formats are not part of the contract: this dataset holds no temporal column.
+# Row uniqueness is not part of it either: duplicated records are legitimate input,
+# removing them is precisely what this pipeline does afterwards.
+DOMAIN_RANGES: dict[str, tuple[float, float]] = {
+    "GRE Score": (0, 340),
+    "TOEFL Score": (0, 120),
+    "SOP": (0, 5),
+    LOR_COLUMN: (0, 5),
+    "CGPA": (0, 10),
+    TARGET_COLUMN: (0, 1),
+}
+VALID_UNIVERSITY_RATINGS = [1.0, 2.0, 3.0, 4.0, 5.0]
+VALID_RESEARCH_VALUES = [0.0, 1.0]
+MAX_NULL_RATIO = 0.10
+MAX_REPORTED_EXAMPLES = 3
+
+
+class FeatureValidationError(Exception):
+    """Raised when the source data breaks the validation contract of the raw layer."""
+
+
+def _tolerated_nulls() -> pa.Check:
+    """Check that a column stays under the tolerated ratio of missing values.
+
+    ``ignore_na`` must be disabled: by default pandera hands checks a series with
+    the missing values already dropped, which would make this ratio always zero.
+    """
+    return pa.Check(
+        lambda column: bool(column.isna().mean() <= MAX_NULL_RATIO),
+        ignore_na=False,
+        error=f"more than {MAX_NULL_RATIO:.0%} of the values are missing",
+    )
+
+
+def _bounded_column(name: str, *, nullable: bool = True) -> pa.Column:
+    """Declare a numeric column bounded by its documented domain range."""
+    minimum, maximum = DOMAIN_RANGES[name]
+    return pa.Column(
+        float,
+        checks=[pa.Check.ge(minimum), pa.Check.le(maximum), _tolerated_nulls()],
+        nullable=nullable,
+    )
+
+
+def _categorical_column(valid_values: list[float]) -> pa.Column:
+    """Declare a discrete column restricted to a closed set of valid categories."""
+    return pa.Column(
+        float,
+        checks=[pa.Check.isin(valid_values), _tolerated_nulls()],
+        nullable=True,
+    )
+
+
+RAW_SCHEMA = pa.DataFrameSchema(
+    columns={
+        "GRE Score": _bounded_column("GRE Score"),
+        "TOEFL Score": _bounded_column("TOEFL Score"),
+        "University Rating": _categorical_column(VALID_UNIVERSITY_RATINGS),
+        "SOP": _bounded_column("SOP"),
+        LOR_COLUMN: _bounded_column(LOR_COLUMN),
+        "CGPA": _bounded_column("CGPA"),
+        BOOLEAN_COLUMN: _categorical_column(VALID_RESEARCH_VALUES),
+        # The label is the one column that may not be missing: a record without it
+        # cannot train anything.
+        TARGET_COLUMN: _bounded_column(TARGET_COLUMN, nullable=False),
+    },
+    checks=[pa.Check(lambda frame: not frame.empty, error="the raw table holds no rows")],
+    strict=True,
+    ordered=True,
+    name="raw admissions data",
+)
+
 
 def find_project_root(start: Path | None = None) -> Path:
     """Walk up from ``start`` until the directory holding ``pyproject.toml`` is found."""
@@ -54,14 +140,43 @@ def find_project_root(start: Path | None = None) -> Path:
 
 
 def load_raw_data(path: Path) -> pd.DataFrame:
-    """Read the raw admissions CSV and check that the expected schema is present."""
+    """Read the raw admissions CSV, without judging its content.
+
+    Extraction never rejects anything: every rule about the source lives in
+    :data:`RAW_SCHEMA`, so there is a single place to read the contract from.
+    """
     logger.info("Reading raw data from %s", path)
     raw = pd.read_csv(path)
-    missing = [column for column in EXPECTED_COLUMNS if column not in raw.columns]
-    if missing:
-        raise ValueError(f"Raw file {path} is missing expected columns: {missing}")
     logger.debug("Raw shape: %s", raw.shape)
     return raw
+
+
+def _describe_failures(error: SchemaErrors) -> str:
+    """Turn the failure cases collected by pandera into a message a person can act on."""
+    lines = ["The raw data does not satisfy the validation contract:"]
+    for (column, check), cases in error.failure_cases.groupby(["column", "check"], dropna=False):
+        subject = column if isinstance(column, str) else "the table"
+        examples = ", ".join(
+            str(case) for case in cases["failure_case"].head(MAX_REPORTED_EXAMPLES)
+        )
+        lines.append(f"  - {subject}: {check} — {len(cases)} case(s), e.g. {examples}")
+    return "\n".join(lines)
+
+
+def validate_raw_data(raw: pd.DataFrame) -> pd.DataFrame:
+    """Check the extracted data against the contract of the raw layer.
+
+    Validation is lazy so that a single run reports every broken rule instead of
+    dying on the first one. Any failure raises :class:`FeatureValidationError`
+    before a single transformation runs, so nothing reaches the feature layer.
+    """
+    logger.info("Validating raw data against the schema of the source")
+    try:
+        validated = RAW_SCHEMA.validate(raw, lazy=True)
+    except SchemaErrors as error:
+        raise FeatureValidationError(_describe_failures(error)) from error
+    logger.info("Raw data is valid: %d rows", len(validated))
+    return pd.DataFrame(validated)
 
 
 def cast_dtypes(frame: pd.DataFrame) -> pd.DataFrame:
@@ -133,8 +248,9 @@ def save_features(features: pd.DataFrame, path: Path) -> Path:
 
 
 def run_pipeline(raw_path: Path, output_path: Path) -> pd.DataFrame:
-    """Run the whole feature pipeline: read the raw layer, transform, persist."""
-    features = build_features(load_raw_data(raw_path))
+    """Run the whole feature pipeline: extract, validate, transform, persist."""
+    raw = validate_raw_data(load_raw_data(raw_path))
+    features = build_features(raw)
     save_features(features, output_path)
     return features
 

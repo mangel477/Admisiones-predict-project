@@ -10,8 +10,10 @@ from pipelines.feature_pipeline.feature_pipeline import (
     FEATURE_COLUMNS,
     FEATURE_RELATIVE_PATH,
     LOR_COLUMN,
+    MAX_NULL_RATIO,
     RAW_RELATIVE_PATH,
     TARGET_COLUMN,
+    FeatureValidationError,
     build_features,
     cast_dtypes,
     drop_exact_duplicates,
@@ -22,6 +24,7 @@ from pipelines.feature_pipeline.feature_pipeline import (
     parse_args,
     run_pipeline,
     save_features,
+    validate_raw_data,
 )
 
 COMPLETE_ROW: dict[str, float | None] = {
@@ -50,6 +53,10 @@ TWO_ROWS = 2
 GRE_OF_COMPLETE_ROW = 337
 CGPA_OF_COMPLETE_ROW = 9.65
 
+# Row counts that put a single missing value on either side of the tolerated ratio.
+ROWS_UNDER_NULL_THRESHOLD = round(2 / MAX_NULL_RATIO)
+ROWS_OVER_NULL_THRESHOLD = round(1 / MAX_NULL_RATIO) - 1
+
 
 def raw_frame(*rows: dict[str, float | None]) -> pd.DataFrame:
     """Build a raw-shaped dataframe, mimicking how ``read_csv`` types the source file."""
@@ -60,6 +67,12 @@ def write_raw_csv(path: Path, frame: pd.DataFrame) -> Path:
     """Persist a raw-shaped dataframe as the pipeline expects to find it on disk."""
     frame.to_csv(path, index=False)
     return path
+
+
+def rows_with_one_null(column: str, total_rows: int) -> pd.DataFrame:
+    """Build ``total_rows`` valid rows where a single one misses ``column``."""
+    incomplete: dict[str, float | None] = {**COMPLETE_ROW, column: None}
+    return raw_frame(incomplete, *([COMPLETE_ROW] * (total_rows - 1)))
 
 
 class TestLoadRawData:
@@ -81,12 +94,145 @@ class TestLoadRawData:
         assert LOR_COLUMN in loaded.columns
         assert TARGET_COLUMN in loaded.columns
 
-    def test_rejects_a_source_missing_expected_columns(self, tmp_path: Path) -> None:
+    def test_only_extracts_and_leaves_judgement_to_the_validation_step(
+        self, tmp_path: Path
+    ) -> None:
+        """Extraction never rejects: the schema owns every rule about the source."""
         incomplete = raw_frame(COMPLETE_ROW).drop(columns=["CGPA"])
         source = write_raw_csv(tmp_path / "raw.csv", incomplete)
 
-        with pytest.raises(ValueError, match="CGPA"):
-            load_raw_data(source)
+        assert "CGPA" not in load_raw_data(source).columns
+
+
+class TestValidateRawDataAccepts:
+    """Valid source data: what the contract deliberately lets through."""
+
+    def test_accepts_a_frame_that_meets_the_contract(self) -> None:
+        valid = raw_frame(COMPLETE_ROW, OTHER_ROW)
+
+        validated = validate_raw_data(valid)
+
+        assert len(validated) == TWO_ROWS
+
+    def test_accepts_duplicate_rows(self) -> None:
+        """Duplicates are legitimate input: removing them is the pipeline's job."""
+        validate_raw_data(raw_frame(COMPLETE_ROW, COMPLETE_ROW, OTHER_ROW))
+
+    def test_accepts_missing_values_below_the_threshold(self) -> None:
+        below_threshold = rows_with_one_null("GRE Score", ROWS_UNDER_NULL_THRESHOLD)
+
+        validate_raw_data(below_threshold)
+
+    def test_accepts_the_extreme_values_of_each_documented_range(self) -> None:
+        extremes: dict[str, float | None] = {
+            **COMPLETE_ROW,
+            "GRE Score": 340.0,
+            "TOEFL Score": 120.0,
+            "University Rating": 5.0,
+            "SOP": 5.0,
+            LOR_COLUMN: 5.0,
+            "CGPA": 10.0,
+            TARGET_COLUMN: 1.0,
+        }
+
+        validate_raw_data(raw_frame(extremes))
+
+
+class TestValidateRawDataRejects:
+    """Invalid source data: one case per rule of the contract."""
+
+    def test_rejects_a_missing_column(self) -> None:
+        incomplete = raw_frame(COMPLETE_ROW).drop(columns=["CGPA"])
+
+        with pytest.raises(FeatureValidationError, match="CGPA"):
+            validate_raw_data(incomplete)
+
+    def test_rejects_an_unexpected_column(self) -> None:
+        with_extra = raw_frame(COMPLETE_ROW).assign(**{"Serial No.": 1.0})
+
+        with pytest.raises(FeatureValidationError, match=r"Serial No\."):
+            validate_raw_data(with_extra)
+
+    def test_rejects_columns_out_of_order(self) -> None:
+        reordered = raw_frame(COMPLETE_ROW)[[*reversed(list(COMPLETE_ROW))]]
+
+        with pytest.raises(FeatureValidationError):
+            validate_raw_data(reordered)
+
+    def test_rejects_a_non_numeric_column(self) -> None:
+        text_in_cgpa = raw_frame(COMPLETE_ROW).astype({"CGPA": "object"})
+        text_in_cgpa.loc[0, "CGPA"] = "nueve"
+
+        with pytest.raises(FeatureValidationError, match="CGPA"):
+            validate_raw_data(text_in_cgpa)
+
+    def test_rejects_a_score_above_its_documented_maximum(self) -> None:
+        impossible = {**COMPLETE_ROW, "GRE Score": 400.0}
+
+        with pytest.raises(FeatureValidationError, match="GRE Score"):
+            validate_raw_data(raw_frame(impossible))
+
+    def test_rejects_a_negative_score(self) -> None:
+        impossible = {**COMPLETE_ROW, "TOEFL Score": -1.0}
+
+        with pytest.raises(FeatureValidationError, match="TOEFL Score"):
+            validate_raw_data(raw_frame(impossible))
+
+    def test_rejects_a_probability_outside_the_unit_interval(self) -> None:
+        impossible = {**COMPLETE_ROW, TARGET_COLUMN: 1.5}
+
+        with pytest.raises(FeatureValidationError, match="Chance of Admit"):
+            validate_raw_data(raw_frame(impossible))
+
+    def test_rejects_an_invalid_university_rating(self) -> None:
+        off_scale = {**COMPLETE_ROW, "University Rating": 7.0}
+
+        with pytest.raises(FeatureValidationError, match="University Rating"):
+            validate_raw_data(raw_frame(off_scale))
+
+    def test_rejects_an_invalid_research_value(self) -> None:
+        not_binary = {**COMPLETE_ROW, "Research": 2.0}
+
+        with pytest.raises(FeatureValidationError, match="Research"):
+            validate_raw_data(raw_frame(not_binary))
+
+    def test_rejects_too_many_missing_values_in_a_column(self) -> None:
+        above_threshold = rows_with_one_null("SOP", ROWS_OVER_NULL_THRESHOLD)
+
+        with pytest.raises(FeatureValidationError, match="SOP"):
+            validate_raw_data(above_threshold)
+
+    def test_rejects_a_missing_label(self) -> None:
+        """A record without its label is not data, it is a hole."""
+        unlabelled: dict[str, float | None] = {**COMPLETE_ROW, TARGET_COLUMN: None}
+
+        with pytest.raises(FeatureValidationError, match="Chance of Admit"):
+            validate_raw_data(raw_frame(unlabelled))
+
+    def test_rejects_an_empty_table(self) -> None:
+        with pytest.raises(FeatureValidationError):
+            validate_raw_data(raw_frame())
+
+
+class TestValidationErrorMessage:
+    """The error a person actually reads when the source is broken."""
+
+    def test_reports_every_broken_rule_at_once(self) -> None:
+        doubly_broken = {**COMPLETE_ROW, "GRE Score": 400.0, "University Rating": 7.0}
+
+        with pytest.raises(FeatureValidationError) as failure:
+            validate_raw_data(raw_frame(doubly_broken))
+
+        assert "GRE Score" in str(failure.value)
+        assert "University Rating" in str(failure.value)
+
+    def test_reports_the_offending_value(self) -> None:
+        impossible = {**COMPLETE_ROW, "GRE Score": 400.0}
+
+        with pytest.raises(FeatureValidationError) as failure:
+            validate_raw_data(raw_frame(impossible))
+
+        assert "400" in str(failure.value)
 
 
 class TestCastDtypes:
@@ -247,6 +393,61 @@ class TestRunPipeline:
         assert destination.exists()
         assert len(features) == TWO_ROWS
         assert list(pd.read_parquet(destination).columns) == [*FEATURE_COLUMNS, TARGET_COLUMN]
+
+    def test_invalid_source_data_aborts_before_writing_anything(self, tmp_path: Path) -> None:
+        impossible = {**COMPLETE_ROW, "GRE Score": 400.0}
+        source = write_raw_csv(tmp_path / "raw.csv", raw_frame(impossible))
+        destination = tmp_path / "features.parquet"
+
+        with pytest.raises(FeatureValidationError, match="GRE Score"):
+            run_pipeline(source, destination)
+
+        assert not destination.exists()
+
+    def test_a_previous_feature_table_survives_a_failed_run(self, tmp_path: Path) -> None:
+        """A broken source must not destroy the last good feature table either."""
+        destination = tmp_path / "features.parquet"
+        run_pipeline(write_raw_csv(tmp_path / "good.csv", raw_frame(COMPLETE_ROW)), destination)
+        impossible = {**COMPLETE_ROW, "CGPA": 42.0}
+        broken = write_raw_csv(tmp_path / "broken.csv", raw_frame(impossible))
+
+        with pytest.raises(FeatureValidationError):
+            run_pipeline(broken, destination)
+
+        assert len(pd.read_parquet(destination)) == ONE_ROW
+
+
+class TestFeatureTableContract:
+    """What the transformation promises to the training pipeline and to the model.
+
+    These properties are false in the raw layer by construction, so the validation
+    gate cannot check them: they are the postcondition of the transformation.
+    """
+
+    def test_uses_the_dtypes_the_model_expects(self) -> None:
+        features = build_features(raw_frame(COMPLETE_ROW, OTHER_ROW))
+
+        assert features["GRE Score"].dtype == "Int64"
+        assert features["TOEFL Score"].dtype == "Int64"
+        assert features["University Rating"].dtype == "Int64"
+        assert features["Research"].dtype == "boolean"
+
+    def test_leaves_no_duplicate_rows(self) -> None:
+        partial_copy = {**COMPLETE_ROW, "CGPA": None}
+        features = build_features(raw_frame(COMPLETE_ROW, COMPLETE_ROW, partial_copy, OTHER_ROW))
+
+        assert not features.duplicated().any()
+
+    def test_leaves_no_missing_values_when_every_gap_is_a_masked_duplicate(self) -> None:
+        partial_copy = {**COMPLETE_ROW, "GRE Score": None}
+        features = build_features(raw_frame(COMPLETE_ROW, partial_copy, OTHER_ROW))
+
+        assert int(features.isna().sum().sum()) == 0
+
+    def test_exposes_exactly_the_columns_the_model_was_fitted_on(self) -> None:
+        features = build_features(raw_frame(COMPLETE_ROW, OTHER_ROW))
+
+        assert list(features.columns) == [*FEATURE_COLUMNS, TARGET_COLUMN]
 
 
 class TestProjectRoot:
