@@ -15,6 +15,8 @@ on:
 jobs:
   labeler:
     runs-on: ubuntu-latest
+    permissions:
+      issues: write
     steps:
       -
         name: Checkout
@@ -23,7 +25,7 @@ jobs:
         name: Run Labeler
         uses: crazy-max/ghaction-github-labeler@v6
         with:
-          github-token: ${{ secrets.PAT }}
+          github-token: ${{ github.token }}
           yaml-file: .github/labels.yml
           dry-run: ${{ github.event_name == 'pull_request' }}
           exclude: |
