@@ -24,6 +24,7 @@ from pipelines.feature_pipeline.feature_pipeline import (
     parse_args,
     run_pipeline,
     save_features,
+    validate_feature_table,
     validate_raw_data,
 )
 
@@ -214,6 +215,74 @@ class TestValidateRawDataRejects:
             validate_raw_data(raw_frame())
 
 
+class TestIntegrityBetweenFields:
+    """Coherence inside a single record."""
+
+    def test_accepts_a_record_with_a_single_observed_predictor(self) -> None:
+        barely_observed: dict[str, float | None] = {
+            **dict.fromkeys(FEATURE_COLUMNS),
+            "CGPA": 8.5,
+            TARGET_COLUMN: 0.7,
+        }
+        # Padded with complete records so the sparse one does not trip the null ratio.
+        padding = [COMPLETE_ROW] * (ROWS_UNDER_NULL_THRESHOLD - 1)
+
+        validate_raw_data(raw_frame(barely_observed, *padding))
+
+    def test_rejects_a_record_with_no_observed_predictor(self) -> None:
+        """Such a record cannot be compared to any other, so it survives deduplication."""
+        only_the_label: dict[str, float | None] = {
+            **dict.fromkeys(FEATURE_COLUMNS),
+            TARGET_COLUMN: 0.7,
+        }
+        padding = [COMPLETE_ROW] * (ROWS_UNDER_NULL_THRESHOLD - 1)
+
+        with pytest.raises(FeatureValidationError, match="predictor"):
+            validate_raw_data(raw_frame(only_the_label, *padding))
+
+    def test_survives_a_frame_without_any_predictor_column(self) -> None:
+        """The missing columns are the schema's business; this rule must not crash."""
+        label_only = raw_frame(COMPLETE_ROW)[[TARGET_COLUMN]]
+
+        with pytest.raises(FeatureValidationError, match="GRE Score"):
+            validate_raw_data(label_only)
+
+
+class TestScaleFormat:
+    """Values must fall on the grid of the instrument that measured them."""
+
+    def test_accepts_half_points_in_the_letter_scales(self) -> None:
+        on_grid = {**COMPLETE_ROW, "SOP": 3.5, LOR_COLUMN: 2.5}
+
+        validate_raw_data(raw_frame(on_grid))
+
+    def test_rejects_a_value_off_the_half_point_grid(self) -> None:
+        off_grid = {**COMPLETE_ROW, "SOP": 3.7}
+
+        with pytest.raises(FeatureValidationError, match="SOP"):
+            validate_raw_data(raw_frame(off_grid))
+
+    def test_rejects_a_fractional_score(self) -> None:
+        fractional = {**COMPLETE_ROW, "GRE Score": 337.5}
+
+        with pytest.raises(FeatureValidationError, match="GRE Score"):
+            validate_raw_data(raw_frame(fractional))
+
+
+class TestIntegrityBetweenRecords:
+    """Coherence across records of the same table."""
+
+    def test_accepts_identical_records_that_agree_on_the_label(self) -> None:
+        validate_raw_data(raw_frame(COMPLETE_ROW, COMPLETE_ROW))
+
+    def test_rejects_identical_predictors_with_different_labels(self) -> None:
+        """The same candidate profile cannot hold two different admission chances."""
+        contradiction = {**COMPLETE_ROW, TARGET_COLUMN: 0.31}
+
+        with pytest.raises(FeatureValidationError, match="contradictory"):
+            validate_raw_data(raw_frame(COMPLETE_ROW, contradiction))
+
+
 class TestValidationErrorMessage:
     """The error a person actually reads when the source is broken."""
 
@@ -225,6 +294,20 @@ class TestValidationErrorMessage:
 
         assert "GRE Score" in str(failure.value)
         assert "University Rating" in str(failure.value)
+
+    def test_does_not_report_a_verdict_as_if_it_were_an_offending_value(self) -> None:
+        """Whole-table rules answer with a boolean; printing it reads as noise."""
+        only_the_label: dict[str, float | None] = {
+            **dict.fromkeys(FEATURE_COLUMNS),
+            TARGET_COLUMN: 0.7,
+        }
+        padding = [COMPLETE_ROW] * (ROWS_UNDER_NULL_THRESHOLD - 1)
+
+        with pytest.raises(FeatureValidationError) as failure:
+            validate_raw_data(raw_frame(only_the_label, *padding))
+
+        assert "predictor" in str(failure.value)
+        assert "False" not in str(failure.value)
 
     def test_reports_the_offending_value(self) -> None:
         impossible = {**COMPLETE_ROW, "GRE Score": 400.0}
@@ -417,37 +500,70 @@ class TestRunPipeline:
         assert len(pd.read_parquet(destination)) == ONE_ROW
 
 
-class TestFeatureTableContract:
-    """What the transformation promises to the training pipeline and to the model.
+class TestValidateFeatureTableContract:
+    """The contract the feature layer offers to the training pipeline and the model.
 
-    These properties are false in the raw layer by construction, so the validation
-    gate cannot check them: they are the postcondition of the transformation.
+    These properties are false in the raw layer by construction, so the entry gate
+    cannot check them: they are the postcondition of the transformation.
     """
 
-    def test_uses_the_dtypes_the_model_expects(self) -> None:
-        features = build_features(raw_frame(COMPLETE_ROW, OTHER_ROW))
+    def test_accepts_the_table_the_pipeline_produces(self) -> None:
+        raw = raw_frame(COMPLETE_ROW, COMPLETE_ROW, OTHER_ROW)
 
-        assert features["GRE Score"].dtype == "Int64"
-        assert features["TOEFL Score"].dtype == "Int64"
-        assert features["University Rating"].dtype == "Int64"
-        assert features["Research"].dtype == "boolean"
+        validated = validate_feature_table(build_features(raw), raw)
 
-    def test_leaves_no_duplicate_rows(self) -> None:
-        partial_copy = {**COMPLETE_ROW, "CGPA": None}
-        features = build_features(raw_frame(COMPLETE_ROW, COMPLETE_ROW, partial_copy, OTHER_ROW))
+        assert len(validated) == TWO_ROWS
 
-        assert not features.duplicated().any()
+    def test_rejects_a_table_typed_as_the_raw_layer(self) -> None:
+        raw = raw_frame(COMPLETE_ROW, OTHER_ROW)
 
-    def test_leaves_no_missing_values_when_every_gap_is_a_masked_duplicate(self) -> None:
-        partial_copy = {**COMPLETE_ROW, "GRE Score": None}
-        features = build_features(raw_frame(COMPLETE_ROW, partial_copy, OTHER_ROW))
+        with pytest.raises(FeatureValidationError, match="GRE Score"):
+            validate_feature_table(raw, raw)
 
-        assert int(features.isna().sum().sum()) == 0
+    def test_rejects_duplicate_rows(self) -> None:
+        raw = raw_frame(COMPLETE_ROW, COMPLETE_ROW)
+        repeated = cast_dtypes(raw)
 
-    def test_exposes_exactly_the_columns_the_model_was_fitted_on(self) -> None:
-        features = build_features(raw_frame(COMPLETE_ROW, OTHER_ROW))
+        with pytest.raises(FeatureValidationError):
+            validate_feature_table(repeated, raw)
 
-        assert list(features.columns) == [*FEATURE_COLUMNS, TARGET_COLUMN]
+    def test_rejects_missing_values(self) -> None:
+        incomplete = {**OTHER_ROW, "SOP": None}
+        raw = raw_frame(COMPLETE_ROW, incomplete)
+
+        with pytest.raises(FeatureValidationError, match="SOP"):
+            validate_feature_table(build_features(raw), raw)
+
+    def test_rejects_an_unexpected_column(self) -> None:
+        raw = raw_frame(COMPLETE_ROW, OTHER_ROW)
+        with_extra = build_features(raw).assign(**{"Serial No.": 1})
+
+        with pytest.raises(FeatureValidationError, match=r"Serial No\."):
+            validate_feature_table(with_extra, raw)
+
+
+class TestIntegrityBetweenDatasets:
+    """The feature table must be derivable from the source it claims to come from."""
+
+    def test_rejects_more_records_than_the_source_holds(self) -> None:
+        raw = raw_frame(COMPLETE_ROW)
+        inflated = cast_dtypes(raw_frame(COMPLETE_ROW, OTHER_ROW))
+
+        with pytest.raises(FeatureValidationError, match="more records"):
+            validate_feature_table(inflated, raw)
+
+    def test_rejects_a_record_absent_from_the_source(self) -> None:
+        """Transforming may drop records; it may never invent one."""
+        raw = raw_frame(COMPLETE_ROW, OTHER_ROW)
+        invented = cast_dtypes(raw_frame({**COMPLETE_ROW, "CGPA": 7.11}))
+
+        with pytest.raises(FeatureValidationError, match="not present in the raw"):
+            validate_feature_table(invented, raw)
+
+    def test_accepts_a_table_that_only_dropped_records(self) -> None:
+        raw = raw_frame(COMPLETE_ROW, COMPLETE_ROW, OTHER_ROW)
+
+        validate_feature_table(build_features(raw), raw)
 
 
 class TestProjectRoot:
