@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Un pipeline de features ejecutable por sí solo, `src/pipelines/feature_pipeline/feature_pipeline.py`, que lee el archivo original de admisiones, aplica las transformaciones independientes del modelo que hasta ahora estaban repetidas dentro de los notebooks —tipado de los puntajes y de la variable de investigación, eliminación de los registros repetidos y de los que un dato faltante mantenía ocultos— y guarda la tabla de features reutilizable en la capa `data/04_feature`. El escalado, la imputación y la codificación no se aplican acá: dependen de los datos de entrenamiento y siguen dentro del pipeline del modelo. Admite rutas y nivel de detalle por línea de comandos.
+- Pandas con soporte de parquet queda declarado como dependencia de ejecución: estaba disponible solo por arrastre de las herramientas de desarrollo, así que el pipeline no se podía ejecutar en un entorno sin ellas.
+
 ## [1.0.0] - 2026-08-26
 
 ### Added
