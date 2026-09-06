@@ -175,7 +175,6 @@ Beyond the number, the app reports what the model does **not** know:
 ├── README.md                           # description of your project
 ├── src                                 # source code for use in this project
 │   ├── README.md                       # description of src structure
-│   ├── tmp_mock.py                     # example python file
 │   ├── data                            # data extraction, validation, processing, transformation
 │   ├── model                           # model training, evaluation, validation, export
 │   ├── inference                       # model prediction, serving, monitoring
@@ -184,7 +183,6 @@ Beyond the number, the app reports what the model does **not** know:
 │       ├── training_pipeline           # transforms features and labels into a model
 │       └── inference_pipeline          # takes features and a trained model for predictions
 ├── tests                               # test code for your project
-│   ├── test_mock.py                    # example test file
 │   ├── data                            # tests for data module
 │   ├── model                           # tests for model module
 │   ├── inference                       # tests for inference module
