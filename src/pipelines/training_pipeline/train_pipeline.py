@@ -23,7 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -59,8 +59,8 @@ STRATIFICATION_BINS = 5
 RIDGE_ALPHA = 10.0
 
 FEATURE_RELATIVE_PATH = Path("data/04_feature/admisiones_features.parquet")
-MODEL_RELATIVE_PATH = Path("models/modelo-seleccion-admisiones.joblib")
-METRICS_RELATIVE_PATH = Path("data/08_reporting/metricas_entrenamiento.json")
+MODEL_RELATIVE_PATH = Path("src/model/modelo-seleccion-admisiones.joblib")
+METRICS_RELATIVE_PATH = Path("src/model/metricas_entrenamiento.json")
 
 
 def find_project_root(start: Path | None = None) -> Path:
@@ -191,7 +191,7 @@ def collect_metrics(
     overfitting, and a report with test alone cannot show it.
     """
     report: dict[str, Any] = {
-        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "model": {
             "family": type(model.named_steps["model"]).__name__,
             "alpha": RIDGE_ALPHA,
@@ -211,7 +211,10 @@ def collect_metrics(
     }
     test = report["metrics"]["test"]
     logger.info(
-        "Test metrics — MAE: %.4f | RMSE: %.4f | R2: %.4f", test["mae"], test["rmse"], test["r2"]
+        "Test metrics — MAE: %.4f | RMSE: %.4f | R2: %.4f",
+        test["mae"],
+        test["rmse"],
+        test["r2"],
     )
     return report
 
