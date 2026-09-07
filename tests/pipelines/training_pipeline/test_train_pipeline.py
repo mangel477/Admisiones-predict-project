@@ -306,8 +306,10 @@ class TestRunPipeline:
         assert model_path.exists()
         assert metrics_path.exists()
         assert report["metrics"]["test"]["r2"] > MINIMUM_LEARNED_R2
-        assert joblib.load(model_path).predict(
-            synthetic_features().head(1)[model.feature_names_in_]
+        # The stored artifact must be the very model that was returned and evaluated.
+        candidate = synthetic_features()[list(model.feature_names_in_)]
+        np.testing.assert_allclose(
+            joblib.load(model_path).predict(candidate), model.predict(candidate)
         )
 
     def test_main_runs_end_to_end(self, tmp_path: Path) -> None:
