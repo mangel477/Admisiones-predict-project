@@ -666,6 +666,19 @@ class TestBuildCandidateFeatures:
 
         assert not build_candidate_features(batch)["Research"].any()
 
+    def test_refuses_a_candidate_with_a_missing_predictor(self) -> None:
+        """The model would fill the hole with the cohort median and never say so."""
+        incomplete: dict[str, float | None] = {**COMPLETE_ROW, "CGPA": None}
+        padding = [COMPLETE_ROW] * (ROWS_UNDER_NULL_THRESHOLD - 1)
+
+        with pytest.raises(FeatureValidationError, match="CGPA"):
+            build_candidate_features(candidate_frame(incomplete, *padding))
+
+    def test_leaves_no_gap_in_the_stored_batch(self) -> None:
+        features = build_candidate_features(candidate_frame(COMPLETE_ROW, OTHER_ROW))
+
+        assert int(features.isna().sum().sum()) == 0
+
     def test_refuses_to_guess_an_unrecognized_research_value(self) -> None:
         """The model would score every unknown value as the majority class."""
         batch = candidate_frame(COMPLETE_ROW).astype({"Research": "object"})

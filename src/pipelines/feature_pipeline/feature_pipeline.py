@@ -374,8 +374,18 @@ def drop_masked_duplicates(frame: pd.DataFrame) -> pd.DataFrame:
     return deduplicated
 
 
+# The historical source tolerates gaps because deduplication resolves them: a record
+# missing a value turns out to be a partial copy of a complete one. A candidate batch has
+# no such mechanism, and the model would quietly fill the hole with the training median —
+# a missing CGPA moves the predicted chance by almost eleven percentage points, with
+# nothing in the output to say the number was partly invented. So this door demands
+# complete records.
 CANDIDATE_SCHEMA = pa.DataFrameSchema(
-    columns={name: column for name, column in RAW_SCHEMA.columns.items() if name != TARGET_COLUMN},
+    columns={
+        name: pa.Column(column.dtype, checks=column.checks, nullable=False)
+        for name, column in RAW_SCHEMA.columns.items()
+        if name != TARGET_COLUMN
+    },
     checks=[
         pa.Check(lambda frame: not frame.empty, error="the candidate batch holds no rows"),
         pa.Check(
@@ -386,6 +396,20 @@ CANDIDATE_SCHEMA = pa.DataFrameSchema(
     strict=True,
     ordered=True,
     name="undecided admissions candidates",
+)
+
+
+# What the candidate batch promises to whoever reads it. Identical to the historical
+# contract except for one invariant: rows are not unique here, because two applicants
+# with the same scores are two people and each one needs their own prediction.
+CANDIDATE_FEATURE_SCHEMA = pa.DataFrameSchema(
+    columns={
+        name: column for name, column in FEATURE_SCHEMA.columns.items() if name != TARGET_COLUMN
+    },
+    checks=[pa.Check(lambda frame: not frame.empty, error="the candidate table holds no rows")],
+    strict=True,
+    ordered=True,
+    name="undecided candidate features",
 )
 
 
@@ -471,15 +495,22 @@ def validate_candidate_data(candidates: pd.DataFrame) -> pd.DataFrame:
 def build_candidate_features(candidates: pd.DataFrame) -> pd.DataFrame:
     """Apply the model-independent transformations to a batch of new candidates.
 
-    Deduplication is deliberately absent. It protects training from counting one record
-    twice; here every applicant is a person waiting for their own answer.
+    What leaves here carries the dtypes and the ranges the model was fitted on, and no
+    gaps, exactly like the historical feature table. It differs in one invariant, on
+    purpose: rows are not unique. Deduplication protects training from counting one
+    record twice; here every applicant is a person waiting for their own answer.
     """
     renamed = _rename_to_canonical(candidates)
     if BOOLEAN_COLUMN in renamed.columns:
         renamed[BOOLEAN_COLUMN] = _normalize_research(renamed[BOOLEAN_COLUMN])
     features = cast_dtypes(validate_candidate_data(renamed))[FEATURE_COLUMNS]
+    features = features.reset_index(drop=True)
+    try:
+        CANDIDATE_FEATURE_SCHEMA.validate(features, lazy=True)
+    except SchemaErrors as error:
+        raise FeatureValidationError(_describe_failures(error)) from error
     logger.info("Candidate feature table shape: %s", features.shape)
-    return features.reset_index(drop=True)
+    return features
 
 
 def build_features(raw: pd.DataFrame) -> pd.DataFrame:
@@ -512,9 +543,11 @@ def run_pipeline(raw_path: Path, output_path: Path) -> pd.DataFrame:
 def run_candidate_pipeline(candidates_path: Path, output_path: Path) -> pd.DataFrame:
     """Take a batch of undecided candidates into the feature store.
 
-    The second door of the store. Records arrive here without a label because nobody
-    has decided them yet, and they leave validated and typed exactly like the
-    historical ones, so whoever reads them downstream does not have to check anything.
+    The second door of the store. Records arrive without a label because nobody has
+    decided them yet, and leave holding the dtypes, ranges and completeness the model
+    expects, so whoever reads them downstream does not have to check the data again.
+    The one invariant that differs from the historical table is uniqueness: repeated
+    applicants are kept.
     """
     features = build_candidate_features(load_raw_data(candidates_path))
     save_features(features, output_path)
