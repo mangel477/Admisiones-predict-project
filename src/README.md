@@ -42,10 +42,14 @@ Two doors into the store, one per kind of record:
 | historical | `data/01_raw/Admission_Predict.csv`, decided applicants | `admisiones_features.parquet` |
 | candidates | any CSV of undecided applicants, via `--candidates-path` | `candidatos_sin_etiqueta.parquet` |
 
-Both apply the same **model-independent** transformations — typing, reading the research
-flag however it was written — and the same validation contract, minus the two rules that
-need a label: there is no admission chance to bound, and records cannot contradict each
-other on an answer nobody has given yet.
+Both apply the same **model-independent** typing and the same validation contract, minus
+the two rules that need a label: there is no admission chance to bound, and records cannot
+contradict each other on an answer nobody has given yet.
+
+Only the candidate door reads the research flag however it was written — `yes`, `sí`, `1`,
+`true` — and refuses what it cannot read. The historical source is a file this project
+controls and its flag is already numeric, so that door demands `0` or `1`. Candidate
+batches arrive from outside, written by whoever filled them in.
 
 They differ in one invariant, on purpose. The historical door deduplicates, so one record
 never counts twice during training. The candidate door does not: two applicants with
@@ -77,8 +81,11 @@ predictions back to the store.
 
 It prepares nothing and validates nothing, and that is the point of the architecture. The
 model-independent transformations already happened at the feature store, and the
-model-dependent ones come inside the artifact with the values they learned. The only
-thing checked here is that the store and the model still describe the same problem.
+model-dependent ones come inside the artifact with the values they learned. The only thing
+checked here is that every column the model was fitted on is present in the stored batch,
+which is then handed over in the model's own order. Nothing about the values themselves is
+re-examined: the feature store already did that, and doing it twice would give those rules
+two owners.
 
 ```bash
 python src/pipelines/inference_pipeline/inference_pipeline.py
@@ -111,15 +118,26 @@ that exists is a file that can be trusted.
 
 ## Folder structure
 
+The code lives under `src/`:
+
 - `src/`
-    - `data/` — data extraction, validation, processing, transformation
-    - `model/` — the model registry of this project: trained artifact, metrics, predictions
-    - `inference/` — model serving and monitoring
     - `pipelines/`
         - `feature_pipeline/` — raw records into reusable features
         - `training_pipeline/` — features and labels into a model
         - `inference_pipeline/` — features and a model into predictions
+    - `model/` — the model registry: trained artifact, metrics, predictions
+    - `data/`, `inference/` — reserved by the project template, still empty
 
-Everything outside `src/` is the proof of concept: the notebooks that explored the
-problem and the Streamlit demo built on top of them. `src/` holds the productionized
-implementation of what those notebooks found.
+The data lives at the repository root, following the layered data-engineering convention
+described in `data/README.md`:
+
+- `data/`
+    - `01_raw/` — the immutable source, never written to
+    - `04_feature/` — the feature store both other pipelines read from
+
+Those two are production inputs and outputs, not scratch space: the pipelines read and
+write them on every run.
+
+The proof of concept is `notebooks/`, which explored the problem, and the Streamlit demo
+it produced under `notebooks/7-deploy/`. `src/` holds the productionized implementation of
+what those notebooks found, and it does not import from them.
