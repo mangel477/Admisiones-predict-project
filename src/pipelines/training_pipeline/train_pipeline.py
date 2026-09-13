@@ -58,6 +58,19 @@ TEST_SIZE = 0.2
 STRATIFICATION_BINS = 5
 RIDGE_ALPHA = 10.0
 
+# Checks that make training unsound when they fail: a record shared by both sides
+# turns the test metrics into a memory test, so the run aborts. Drift between the
+# two sides is reported as a warning instead — it is a signal worth investigating,
+# not proof that the split cannot be used.
+INDEX_OVERLAP_CHECK = "Index overlap"
+RECORD_OVERLAP_CHECK = "Record overlap"
+LEAKAGE_CHECKS = frozenset({INDEX_OVERLAP_CHECK, RECORD_OVERLAP_CHECK})
+
+
+class TrainTestSplitError(Exception):
+    """Raised when the train/test split leaks information between both sides."""
+
+
 FEATURE_RELATIVE_PATH = Path("data/04_feature/admisiones_features.parquet")
 MODEL_RELATIVE_PATH = Path("src/model/modelo-seleccion-admisiones.joblib")
 METRICS_RELATIVE_PATH = Path("src/model/metricas_entrenamiento.json")
@@ -110,6 +123,178 @@ def split_train_test(
     )
     logger.info("Split: %d training records, %d test records", len(x_train), len(x_test))
     return x_train, x_test, y_train, y_test
+
+
+def _as_plain_numeric(predictors: pd.DataFrame, label: pd.Series) -> pd.DataFrame:
+    """Join one side of the split into the flat numeric frame the drift report takes."""
+    joined = pd.concat([predictors, label], axis="columns")
+    return joined.apply(pd.to_numeric, errors="coerce").astype("float64")
+
+
+def _measure_leakage(
+    x_train: pd.DataFrame,
+    x_test: pd.DataFrame,
+    y_train: pd.Series,
+    y_test: pd.Series,
+) -> dict[str, Any]:
+    """Count records the two sides share, by index and by content.
+
+    Leakage is not a statistical question, it is a set intersection, so it is
+    measured exactly here instead of being estimated by a library. Content overlap
+    is the one that matters: two different index labels can still carry the same
+    candidate, and the model would then be scored on a record it memorized.
+    """
+    shared_index = sorted(set(x_train.index) & set(x_test.index))
+    train_records = _as_plain_numeric(x_train, y_train)
+    test_records = _as_plain_numeric(x_test, y_test)
+    traced = test_records.merge(train_records.drop_duplicates(), how="left", indicator=True)
+    shared_records = int((traced["_merge"] == "both").sum())
+    return {
+        "shared_index_records": len(shared_index),
+        "shared_record_count": shared_records,
+        "shared_record_share": round(shared_records / max(len(test_records), 1), 4),
+    }
+
+
+def _measure_drift(
+    x_train: pd.DataFrame,
+    x_test: pd.DataFrame,
+    y_train: pd.Series,
+    y_test: pd.Series,
+) -> dict[str, Any]:
+    """Compare the distribution of every column between the two sides with evidently.
+
+    The label is measured too: a split whose features match but whose target does
+    not is still a split the test metrics cannot be trusted on.
+
+    evidently is imported here rather than at the top of the module because it costs
+    about three seconds to import, and every caller would pay it — including
+    ``--help`` and every test collection — for a function most of them never reach.
+    """
+    from evidently import DataDefinition, Dataset, Report  # noqa: PLC0415
+    from evidently.metrics import DriftedColumnsCount, ValueDrift  # noqa: PLC0415
+
+    columns = [*NUMERIC_COLUMNS, *BINARY_COLUMNS, TARGET_COLUMN]
+    definition = DataDefinition(
+        numerical_columns=[*NUMERIC_COLUMNS, TARGET_COLUMN],
+        categorical_columns=list(BINARY_COLUMNS),
+    )
+    report = Report(metrics=[*[ValueDrift(column=name) for name in columns], DriftedColumnsCount()])
+    result = report.run(
+        current_data=Dataset.from_pandas(
+            _as_plain_numeric(x_test, y_test), data_definition=definition
+        ),
+        reference_data=Dataset.from_pandas(
+            _as_plain_numeric(x_train, y_train), data_definition=definition
+        ),
+    )
+
+    measured = result.dict()["metrics"]
+    per_column: list[dict[str, Any]] = []
+    for entry in measured[:-1]:
+        config = entry["config"]
+        score = float(entry["value"])
+        threshold = float(config["threshold"])
+        per_column.append(
+            {
+                "name": config["column"],
+                "method": config["method"],
+                "score": round(score, 6),
+                "threshold": threshold,
+                "drifted": score < threshold,
+            }
+        )
+    summary = measured[-1]["value"]
+    return {
+        "drifted_columns": int(summary["count"]),
+        "drifted_share": float(summary["share"]),
+        "columns": per_column,
+    }
+
+
+def validate_train_test_split(
+    x_train: pd.DataFrame,
+    x_test: pd.DataFrame,
+    y_train: pd.Series,
+    y_test: pd.Series,
+) -> dict[str, Any]:
+    """Check the split for leakage and for distribution differences between sides.
+
+    Leakage is fatal: if a record appears on both sides, the test metrics measure
+    memory instead of generalization, so every number downstream is a lie. Those
+    checks raise :class:`TrainTestSplitError` before any model is fitted.
+
+    Drift is reported as a warning. With a stratified split it should not appear,
+    and when it does it points at the data rather than at the split, so the run
+    continues and the report carries the evidence.
+    """
+    logger.info("Validating the train/test split")
+    leakage = _measure_leakage(x_train, x_test, y_train, y_test)
+    drift = _measure_drift(x_train, x_test, y_train, y_test)
+
+    checks: list[dict[str, Any]] = []
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    overlaps = (
+        (
+            INDEX_OVERLAP_CHECK,
+            leakage["shared_index_records"],
+            f"{leakage['shared_index_records']} record(s) appear on both sides by index",
+        ),
+        (
+            RECORD_OVERLAP_CHECK,
+            leakage["shared_record_count"],
+            f"{leakage['shared_record_count']} test record(s) also appear in training, "
+            f"{leakage['shared_record_share']:.2%} of the test set",
+        ),
+    )
+    for name, count, details in overlaps:
+        failed = count > 0
+        checks.append(
+            {
+                "name": name,
+                "status": "failed" if failed else "passed",
+                "severity": "error",
+                "details": details if failed else "",
+            }
+        )
+        if failed:
+            errors.append(f"{name}: {details}")
+
+    for column in drift["columns"]:
+        details = f"{column['method']} = {column['score']} below threshold {column['threshold']}"
+        checks.append(
+            {
+                "name": f"Drift: {column['name']}",
+                "status": "failed" if column["drifted"] else "passed",
+                "severity": "warning",
+                "details": details if column["drifted"] else "",
+            }
+        )
+        if column["drifted"]:
+            warnings.append(f"drift detected in {column['name']} — {details}")
+
+    report = {
+        "passed": not errors,
+        "leakage": leakage,
+        "drift": drift,
+        "checks": checks,
+        "errors": errors,
+        "warnings": warnings,
+    }
+    for warning in warnings:
+        logger.warning("Train/test split: %s", warning)
+    if errors:
+        raise TrainTestSplitError(
+            "\n".join(["The train/test split leaks information between both sides:", *errors])
+        )
+    logger.info(
+        "Train/test split is sound: no shared records, %d of %d columns drifted",
+        drift["drifted_columns"],
+        len(drift["columns"]),
+    )
+    return report
 
 
 def build_preprocessor() -> ColumnTransformer:
@@ -241,8 +426,10 @@ def run_pipeline(
     """Run the whole training pipeline: read, split, train, evaluate, persist."""
     predictors, label = split_features_and_label(load_features(features_path))
     x_train, x_test, y_train, y_test = split_train_test(predictors, label)
+    split_report = validate_train_test_split(x_train, x_test, y_train, y_test)
     model = train_model(x_train, y_train)
     report = collect_metrics(model, x_train, x_test, y_train, y_test)
+    report["split_validation"] = split_report
     save_model(model, model_path)
     save_metrics(report, metrics_path)
     return model, report

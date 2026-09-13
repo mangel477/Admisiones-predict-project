@@ -1,6 +1,7 @@
 """Unit tests for the admissions training pipeline."""
 
 import json
+import logging
 from pathlib import Path
 
 import joblib
@@ -16,6 +17,7 @@ from pipelines.training_pipeline.train_pipeline import (
     RIDGE_ALPHA,
     TARGET_COLUMN,
     TEST_SIZE,
+    TrainTestSplitError,
     build_model,
     collect_metrics,
     evaluate_model,
@@ -29,6 +31,7 @@ from pipelines.training_pipeline.train_pipeline import (
     split_features_and_label,
     split_train_test,
     train_model,
+    validate_train_test_split,
 )
 
 SYNTHETIC_ROWS = 60
@@ -36,6 +39,47 @@ METRIC_NAMES = ("mae", "rmse", "r2")
 PERFECT_R2 = 1.0
 MINIMUM_LEARNED_R2 = 0.9
 EXPECTED_TEST_ROWS = round(SYNTHETIC_ROWS * TEST_SIZE)
+
+# The split checks need enough records to say anything meaningful about a distribution.
+VALIDATION_ROWS = 300
+LEAKED_RECORDS = 40
+
+
+def realistic_features(rows: int = VALIDATION_ROWS) -> pd.DataFrame:
+    """Build a feature table whose signal carries noise, like real admissions data.
+
+    A target that is a pure function of one column makes the correlation checks fire
+    on the fixture itself, which would tell us nothing about the split.
+    """
+    rng = np.random.default_rng(7)
+    cgpa = rng.uniform(6.8, 9.9, rows).round(2)
+    gre = rng.integers(290, 341, rows)
+    frame = pd.DataFrame(
+        {
+            "GRE Score": pd.array(gre, dtype="Int64"),
+            "TOEFL Score": pd.array(rng.integers(92, 121, rows), dtype="Int64"),
+            "University Rating": pd.array(rng.integers(1, 6, rows), dtype="Int64"),
+            "SOP": rng.integers(2, 11, rows) / 2,
+            "LOR ": rng.integers(2, 11, rows) / 2,
+            "CGPA": cgpa,
+            "Research": pd.array(rng.integers(0, 2, rows).astype(bool), dtype="boolean"),
+        }
+    )
+    signal = (cgpa - 6.8) / 3.1 * 0.4 + (gre - 290) / 50 * 0.2 + 0.3
+    frame[TARGET_COLUMN] = (signal + rng.normal(0, 0.05, rows)).clip(0.05, 0.99).round(4)
+    return frame
+
+
+def leak_train_records_into_test(
+    x_train: pd.DataFrame,
+    x_test: pd.DataFrame,
+    y_train: pd.Series,
+    y_test: pd.Series,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
+    """Contaminate the test side with records copied straight out of training."""
+    leaked_x = pd.concat([x_test, x_train.head(LEAKED_RECORDS)])
+    leaked_y = pd.concat([y_test, y_train.head(LEAKED_RECORDS)])
+    return x_train, leaked_x, y_train, leaked_y
 
 
 def synthetic_features(rows: int = SYNTHETIC_ROWS) -> pd.DataFrame:
@@ -136,6 +180,83 @@ class TestSplitTrainTest:
         second, _, _, _ = split_train_test(predictors, label)
 
         assert list(first.index) == list(second.index)
+
+
+class TestValidateTrainTestSplitAccepts:
+    """A sound split: what the checks let through."""
+
+    def test_accepts_the_split_the_pipeline_produces(self) -> None:
+        splits = split_train_test(*split_features_and_label(realistic_features()))
+
+        report = validate_train_test_split(*splits)
+
+        assert report["errors"] == []
+
+    def test_reports_every_check_it_ran(self) -> None:
+        splits = split_train_test(*split_features_and_label(realistic_features()))
+
+        report = validate_train_test_split(*splits)
+
+        assert report["checks"]
+        assert {check["status"] for check in report["checks"]} <= {"passed", "failed"}
+        assert all(check["name"] for check in report["checks"])
+
+    def test_reports_no_shared_records_between_the_two_sides(self) -> None:
+        splits = split_train_test(*split_features_and_label(realistic_features()))
+
+        report = validate_train_test_split(*splits)
+
+        assert report["leakage"]["shared_index_records"] == 0
+        assert report["leakage"]["shared_record_count"] == 0
+
+
+class TestValidateTrainTestSplitRejects:
+    """Leakage: the failure that invalidates every metric downstream."""
+
+    def test_rejects_training_records_present_in_the_test_set(self) -> None:
+        splits = split_train_test(*split_features_and_label(realistic_features()))
+
+        with pytest.raises(TrainTestSplitError, match="Record overlap"):
+            validate_train_test_split(*leak_train_records_into_test(*splits))
+
+    def test_the_error_names_the_contaminated_share(self) -> None:
+        splits = split_train_test(*split_features_and_label(realistic_features()))
+
+        with pytest.raises(TrainTestSplitError) as failure:
+            validate_train_test_split(*leak_train_records_into_test(*splits))
+
+        assert "%" in str(failure.value)
+
+
+class TestValidateTrainTestSplitWarns:
+    """Distribution problems: reported, never fatal."""
+
+    def test_a_drifted_split_warns_instead_of_failing(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Drift is a signal to investigate, not proof that the split is unusable."""
+        x_train, x_test, y_train, y_test = split_train_test(
+            *split_features_and_label(realistic_features())
+        )
+        drifted = x_test.assign(CGPA=x_test["CGPA"] - 2.0)
+
+        with caplog.at_level(logging.WARNING):
+            report = validate_train_test_split(x_train, drifted, y_train, y_test)
+
+        assert report["errors"] == []
+        assert report["warnings"]
+        assert "drift" in caplog.text.lower()
+        drifted_columns = [c["name"] for c in report["drift"]["columns"] if c["drifted"]]
+        assert "CGPA" in drifted_columns
+
+    def test_measures_drift_on_every_column_including_the_label(self) -> None:
+        """A drift report that skips a column says nothing about that column."""
+        splits = split_train_test(*split_features_and_label(realistic_features()))
+
+        report = validate_train_test_split(*splits)
+
+        measured = {column["name"] for column in report["drift"]["columns"]}
+        assert measured == {*NUMERIC_COLUMNS, *BINARY_COLUMNS, TARGET_COLUMN}
 
 
 class TestBuildModel:
@@ -311,6 +432,19 @@ class TestRunPipeline:
         np.testing.assert_allclose(
             joblib.load(model_path).predict(candidate), model.predict(candidate)
         )
+
+    def test_a_leaky_feature_table_aborts_before_anything_is_stored(self, tmp_path: Path) -> None:
+        """Duplicated records scatter copies of one candidate across both sides."""
+        duplicated = pd.concat([realistic_features(VALIDATION_ROWS // 2)] * 2)
+        source = write_features(tmp_path / "features.parquet", duplicated)
+        model_path = tmp_path / "model.joblib"
+        metrics_path = tmp_path / "metrics.json"
+
+        with pytest.raises(TrainTestSplitError):
+            run_pipeline(source, model_path, metrics_path)
+
+        assert not model_path.exists()
+        assert not metrics_path.exists()
 
     def test_main_runs_end_to_end(self, tmp_path: Path) -> None:
         source = write_features(tmp_path / "features.parquet", synthetic_features())
