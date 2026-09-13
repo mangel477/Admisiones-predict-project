@@ -214,8 +214,12 @@ def mostrar_contribuciones(modelo: Pipeline, datos: pd.DataFrame) -> None:
     """Break the prediction down into each attribute's contribution.
 
     The model is linear, so the prediction is the intercept plus the sum of
-    coefficient times standardized value. That decomposition is exact, not an
+    coefficient times transformed value. That decomposition is exact, not an
     approximation, and explains why the prediction is what it is.
+
+    "Transformed" rather than "standardized": only the numeric columns go through
+    StandardScaler, while the research flag is ordinal-encoded, so its value is a
+    code and not a z-score.
     """
     preprocesador = modelo.named_steps["preprocessor"]
     regresor = modelo.named_steps["model"]
@@ -226,7 +230,7 @@ def mostrar_contribuciones(modelo: Pipeline, datos: pd.DataFrame) -> None:
     contribuciones = pd.DataFrame(
         {
             "contribución": regresor.coef_ * transformado,
-            "valor estandarizado": transformado,
+            "valor transformado": transformado,
         },
         index=[nombre.split("__", 1)[1] for nombre in preprocesador.get_feature_names_out()],
     ).sort_values("contribución", key=abs, ascending=False)
