@@ -112,6 +112,15 @@ def _rename_to_canonical(frame: pd.DataFrame, expected: list[str]) -> pd.DataFra
         for column in frame.columns
         if column.strip().lower() in canonical
     }
+    collisions: dict[str, list[str]] = {}
+    for original, target in renamed.items():
+        collisions.setdefault(target, []).append(original)
+    ambiguous = {target: sources for target, sources in collisions.items() if len(sources) > 1}
+    if ambiguous:
+        raise InferenceInputError(
+            "The batch carries more than one header for the same column, so which one "
+            f"the model should read is undecidable: {ambiguous}"
+        )
     return frame.rename(columns=renamed)
 
 
@@ -154,6 +163,28 @@ def _convert_numeric(frame: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
     return converted
 
 
+def _as_whole_numbers(frame: pd.DataFrame) -> pd.DataFrame:
+    """Type the whole-number columns, refusing fractional values instead of rounding.
+
+    A CSV hands these back as ``324.0``, which is the same candidate and casts cleanly.
+    A ``320.5`` is not: exam scores and ratings are whole numbers, so rounding it would
+    score a candidate the file never described — the same silent rewrite this pipeline
+    refuses everywhere else.
+    """
+    typed = frame.copy()
+    for column in typed.columns:
+        values = typed[column]
+        fractional = values[values.notna() & (values % 1 != 0)]
+        if not fractional.empty:
+            examples = ", ".join(repr(value) for value in fractional.head(MAX_REPORTED_EXAMPLES))
+            raise InferenceInputError(
+                f"Column {column!r} holds {len(fractional)} value(s) that are not whole "
+                f"numbers: {examples}. Rounding them would score a different candidate."
+            )
+        typed[column] = values.astype("Int64")
+    return typed
+
+
 def prepare_features(candidates: pd.DataFrame, expected_columns: list[str]) -> pd.DataFrame:
     """Bring a batch of new candidates to the shape the model was fitted on.
 
@@ -165,10 +196,15 @@ def prepare_features(candidates: pd.DataFrame, expected_columns: list[str]) -> p
     if missing:
         raise InferenceInputError(f"The batch is missing the column(s) the model needs: {missing}")
 
+    # Every conversion below is scoped to what this artifact actually asks for, so a
+    # model retrained on a different set of columns is handled rather than crashed on.
+    integer_columns = [column for column in INTEGER_COLUMNS if column in expected_columns]
     numeric_columns = [column for column in expected_columns if column != RESEARCH_COLUMN]
+
     prepared = _convert_numeric(renamed[expected_columns], numeric_columns)
-    prepared[INTEGER_COLUMNS] = prepared[INTEGER_COLUMNS].round().astype("Int64")
-    prepared[RESEARCH_COLUMN] = _convert_research(renamed[RESEARCH_COLUMN])
+    prepared[integer_columns] = _as_whole_numbers(prepared[integer_columns])
+    if RESEARCH_COLUMN in expected_columns:
+        prepared[RESEARCH_COLUMN] = _convert_research(renamed[RESEARCH_COLUMN])
     logger.info("Prepared %d candidate(s) for scoring", len(prepared))
     return prepared[expected_columns]
 

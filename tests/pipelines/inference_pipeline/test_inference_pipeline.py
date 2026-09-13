@@ -158,6 +158,47 @@ class TestPrepareFeatures:
         with pytest.raises(InferenceInputError, match="CGPA"):
             prepare_features(incomplete, MODEL_COLUMNS)
 
+    def test_accepts_whole_numbers_written_as_decimals(self) -> None:
+        """A CSV read by pandas hands back 324.0, not 324."""
+        candidates = synthetic_candidates(TWO_ROWS)
+        candidates.loc[:, "GRE Score"] = [324.0, 310.0]
+
+        prepared = prepare_features(candidates, MODEL_COLUMNS)
+
+        assert prepared["GRE Score"].tolist() == [324, 310]
+
+    def test_refuses_to_round_a_fractional_score(self) -> None:
+        """Rounding would score a different candidate than the one in the file."""
+        candidates = synthetic_candidates(TWO_ROWS)
+        candidates.loc[0, "GRE Score"] = 320.5
+
+        with pytest.raises(InferenceInputError, match=r"320\.5"):
+            prepare_features(candidates, MODEL_COLUMNS)
+
+    def test_refuses_to_round_a_fractional_rating(self) -> None:
+        candidates = synthetic_candidates(TWO_ROWS)
+        candidates.loc[0, "University Rating"] = 3.7
+
+        with pytest.raises(InferenceInputError, match="University Rating"):
+            prepare_features(candidates, MODEL_COLUMNS)
+
+    def test_reports_headers_that_collapse_to_the_same_column(self) -> None:
+        """Two spellings of one column leave the batch ambiguous, not mergeable."""
+        candidates = synthetic_candidates(TWO_ROWS)
+        candidates[" research "] = 0
+
+        with pytest.raises(InferenceInputError, match="Research"):
+            prepare_features(candidates, MODEL_COLUMNS)
+
+    def test_adapts_to_an_artifact_with_a_different_contract(self) -> None:
+        """The contract comes from the artifact, so a narrower one must still work."""
+        narrower = ["GRE Score", "CGPA"]
+
+        prepared = prepare_features(synthetic_candidates(), narrower)
+
+        assert list(prepared.columns) == narrower
+        assert prepared["GRE Score"].dtype == "Int64"
+
     def test_reports_a_non_numeric_value(self) -> None:
         broken = synthetic_candidates().astype({"CGPA": "object"})
         broken.loc[0, "CGPA"] = "nueve"
