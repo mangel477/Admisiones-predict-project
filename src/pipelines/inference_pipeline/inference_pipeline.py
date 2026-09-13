@@ -132,9 +132,22 @@ def predict(model: Any, features: pd.DataFrame) -> np.ndarray:
 
 
 def save_predictions(candidates: pd.DataFrame, predictions: np.ndarray, path: Path) -> pd.DataFrame:
-    """Store every candidate next to the chance the model gave it."""
+    """Store every candidate next to the chance the model gave it.
+
+    The predictions are placed by position. Handing pandas a labelled series would let
+    it align by index instead, and an index that does not match the batch writes a
+    column of silent NaNs rather than failing — the batch would look scored when it is
+    not. The count is checked for the same reason: this function promises one chance
+    per candidate, so it says when it cannot keep that promise.
+    """
+    values = np.asarray(predictions, dtype="float64")
+    if len(values) != len(candidates):
+        raise InferenceError(
+            f"Expected one prediction per candidate, got {len(values)} prediction(s) "
+            f"for {len(candidates)} candidate(s)"
+        )
     scored = candidates.copy()
-    scored[PREDICTION_COLUMN] = predictions
+    scored[PREDICTION_COLUMN] = values
     path.parent.mkdir(parents=True, exist_ok=True)
     scored.to_csv(path, index=False)
     logger.info("Predictions stored in %s", path)

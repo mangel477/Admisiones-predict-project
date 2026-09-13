@@ -208,6 +208,21 @@ class TestSavePredictions:
         assert set(MODEL_COLUMNS) <= set(stored.columns)
         assert stored[PREDICTION_COLUMN].to_numpy() == pytest.approx(predictions)
 
+    def test_places_predictions_by_position_not_by_index(self, tmp_path: Path) -> None:
+        """A labelled series would otherwise align by index and write silent NaNs."""
+        candidates = stored_candidates(TWO_ROWS)
+        labelled = pd.Series([0.4, 0.6], index=[97, 98])
+
+        scored = save_predictions(candidates, labelled, tmp_path / "predicciones.csv")
+
+        assert scored[PREDICTION_COLUMN].tolist() == pytest.approx([0.4, 0.6])
+
+    def test_refuses_a_prediction_count_that_does_not_match_the_batch(self, tmp_path: Path) -> None:
+        candidates = stored_candidates()
+
+        with pytest.raises(InferenceError, match="one prediction per candidate"):
+            save_predictions(candidates, np.zeros(TWO_ROWS), tmp_path / "predicciones.csv")
+
 
 class TestRunPipeline:
     """The autonomous entry point."""
