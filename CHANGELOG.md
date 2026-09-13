@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Un pipeline de inferencia ejecutable por sí solo, `src/pipelines/inference_pipeline/inference_pipeline.py`, que carga el modelo entrenado, lee del almacén de features el lote de candidatos pendientes y guarda cada uno junto a su probabilidad estimada de admisión. Acota las probabilidades al rango válido, porque una regresión lineal puede devolver valores por fuera para candidatos en los extremos, y avisa cuántas acotó.
+- El pipeline de inferencia no prepara ni valida los datos, y esa es la razón de ser de la arquitectura: las transformaciones que no dependen del modelo ya ocurrieron en el pipeline de features, en la puerta por donde los candidatos entran al sistema, y las que sí dependen de él viajan dentro del archivo del modelo con los valores que aprendieron durante el entrenamiento. Lo único que verifica es que el almacén y el modelo sigan describiendo el mismo problema: si alguien entrena un modelo con otras columnas, el proceso se detiene con un mensaje que dice qué falta y qué volver a ejecutar, en lugar de fallar con un error interno de la librería.
+
 - El pipeline de features acepta ahora lotes de candidatos que todavía no tienen respuesta de admisión, y los deja en la capa de features listos para ser puntuados. Aplica las mismas reglas que al archivo histórico salvo las dos que necesitan la respuesta: no hay probabilidad que acotar, ni registros que puedan contradecirse sobre una respuesta que nadie dio. Reconoce los nombres de columna sin distinguir mayúsculas ni espacios, acepta la variable de investigación escrita de varias formas y rechaza la ejecución completa cuando encuentra un valor que no puede interpretar. Se ejecuta con `--candidates-path`.
 - Los candidatos nuevos no se deduplican, a diferencia del archivo histórico: dos aspirantes con los mismos puntajes son dos personas, y cada una necesita su propia predicción.
 

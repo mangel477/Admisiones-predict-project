@@ -6,6 +6,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from pipelines.feature_pipeline import feature_pipeline
 from pipelines.feature_pipeline.feature_pipeline import (
     FEATURE_COLUMNS,
     FEATURE_RELATIVE_PATH,
@@ -673,6 +674,17 @@ class TestBuildCandidateFeatures:
 
         with pytest.raises(FeatureValidationError, match="CGPA"):
             build_candidate_features(candidate_frame(incomplete, *padding))
+
+    def test_catches_a_transformation_that_breaks_the_output_contract(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The postcondition is a net: it only fires if a transformation stops honouring it."""
+        monkeypatch.setattr(
+            feature_pipeline, "cast_dtypes", lambda frame: frame.astype({"CGPA": "object"})
+        )
+
+        with pytest.raises(FeatureValidationError, match="CGPA"):
+            build_candidate_features(candidate_frame(COMPLETE_ROW, OTHER_ROW))
 
     def test_leaves_no_gap_in_the_stored_batch(self) -> None:
         features = build_candidate_features(candidate_frame(COMPLETE_ROW, OTHER_ROW))
