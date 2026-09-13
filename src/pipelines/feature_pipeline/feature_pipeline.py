@@ -49,6 +49,7 @@ EXPECTED_COLUMNS = [*FEATURE_COLUMNS, TARGET_COLUMN]
 
 RAW_RELATIVE_PATH = Path("data/01_raw/Admission_Predict.csv")
 FEATURE_RELATIVE_PATH = Path("data/04_feature/admisiones_features.parquet")
+CANDIDATES_RELATIVE_PATH = Path("data/04_feature/candidatos_sin_etiqueta.parquet")
 
 # Validation contract of the raw layer.
 #
@@ -70,6 +71,11 @@ DOMAIN_RANGES: dict[str, tuple[float, float]] = {
 }
 VALID_UNIVERSITY_RATINGS = [1.0, 2.0, 3.0, 4.0, 5.0]
 VALID_RESEARCH_VALUES = [0.0, 1.0]
+
+# Spellings accepted for the research flag of an undecided candidate. Batches reach the
+# store from outside the project, so the flag arrives written however someone typed it.
+RESEARCH_TRUE = frozenset({"1", "1.0", "true", "t", "yes", "y", "si", "sí", "verdadero"})
+RESEARCH_FALSE = frozenset({"0", "0.0", "false", "f", "no", "n", "falso"})
 MAX_NULL_RATIO = 0.10
 MAX_REPORTED_EXAMPLES = 3
 
@@ -368,6 +374,145 @@ def drop_masked_duplicates(frame: pd.DataFrame) -> pd.DataFrame:
     return deduplicated
 
 
+# The historical source tolerates gaps because deduplication resolves them: a record
+# missing a value turns out to be a partial copy of a complete one. A candidate batch has
+# no such mechanism, and the model would quietly fill the hole with the training median —
+# a missing CGPA moves the predicted chance by almost eleven percentage points, with
+# nothing in the output to say the number was partly invented. So this door demands
+# complete records.
+CANDIDATE_SCHEMA = pa.DataFrameSchema(
+    columns={
+        name: pa.Column(column.dtype, checks=column.checks, nullable=False)
+        for name, column in RAW_SCHEMA.columns.items()
+        if name != TARGET_COLUMN
+    },
+    checks=[
+        pa.Check(lambda frame: not frame.empty, error="the candidate batch holds no rows"),
+        pa.Check(
+            _every_record_observes_a_predictor,
+            error="a candidate arrived without a single observed predictor",
+        ),
+    ],
+    strict=True,
+    ordered=True,
+    name="undecided admissions candidates",
+)
+
+
+# What the candidate batch promises to whoever reads it. Identical to the historical
+# contract except for one invariant: rows are not unique here, because two applicants
+# with the same scores are two people and each one needs their own prediction.
+CANDIDATE_FEATURE_SCHEMA = pa.DataFrameSchema(
+    columns={
+        name: column for name, column in FEATURE_SCHEMA.columns.items() if name != TARGET_COLUMN
+    },
+    checks=[pa.Check(lambda frame: not frame.empty, error="the candidate table holds no rows")],
+    strict=True,
+    ordered=True,
+    name="undecided candidate features",
+)
+
+
+def _rename_to_canonical(frame: pd.DataFrame) -> pd.DataFrame:
+    """Match incoming headers to the expected columns, ignoring case and spacing.
+
+    Candidates reach the feature store from outside the project, written by people who
+    do not know that ``"LOR "`` carries a trailing space. Two headers that collapse to
+    the same column leave the batch ambiguous, so they are refused rather than merged.
+    """
+    canonical = {name.strip().lower(): name for name in FEATURE_COLUMNS}
+    renamed = {
+        column: canonical[column.strip().lower()]
+        for column in frame.columns
+        if column.strip().lower() in canonical
+    }
+    collisions: dict[str, list[str]] = {}
+    for original, target in renamed.items():
+        collisions.setdefault(target, []).append(original)
+    ambiguous = {target: sources for target, sources in collisions.items() if len(sources) > 1}
+    if ambiguous:
+        raise FeatureValidationError(
+            "The batch carries more than one header for the same column, so which one "
+            f"should reach the model is undecidable: {ambiguous}"
+        )
+    return frame.rename(columns=renamed)
+
+
+def _normalize_research(values: pd.Series) -> pd.Series:
+    """Read the research flag however it was written, refusing what cannot be read.
+
+    Unrecognized values must not survive this door. Downstream, the encoder maps them
+    to NaN and the imputer fills that with the majority class, so "No", "0" read as
+    text, and an outright typo would all end up scored as "Yes".
+    """
+    spelled = values.astype("string").str.strip().str.lower()
+    converted = spelled.map(
+        lambda value: 1.0 if value in RESEARCH_TRUE else (0.0 if value in RESEARCH_FALSE else pd.NA)
+    )
+    unrecognized = values[converted.isna() & values.notna()]
+    if not unrecognized.empty:
+        examples = ", ".join(repr(value) for value in unrecognized.head(MAX_REPORTED_EXAMPLES))
+        raise FeatureValidationError(
+            f"Column {BOOLEAN_COLUMN!r} holds {len(unrecognized)} value(s) that cannot be "
+            f"read as yes or no: {examples}. Every one of them would be scored as the "
+            f"majority class, so they are refused instead of guessed."
+        )
+    return converted.astype("float64")
+
+
+def _as_float_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    """Bring already-numeric columns to float, the representation the contract states.
+
+    A clean candidate batch carries no gaps, so pandas types its whole numbers as
+    ``int64`` and the schema would refuse valid data over a detail of type inference.
+    Columns that are not numeric at all are left untouched: the schema has to see them
+    and say so itself.
+    """
+    numeric = frame.copy()
+    for column in numeric.columns:
+        if pd.api.types.is_numeric_dtype(numeric[column]):
+            numeric[column] = numeric[column].astype("float64")
+    return numeric
+
+
+def validate_candidate_data(candidates: pd.DataFrame) -> pd.DataFrame:
+    """Check a batch of undecided candidates against the contract of the source.
+
+    Same rules as the historical source, minus the two that need a label: there is no
+    target to bound, and records cannot contradict each other on an answer nobody has
+    given yet. Duplicates are allowed on purpose — two applicants with identical scores
+    are two people, and each one needs their own prediction.
+    """
+    logger.info("Validating a batch of undecided candidates")
+    try:
+        validated = CANDIDATE_SCHEMA.validate(_as_float_columns(candidates), lazy=True)
+    except SchemaErrors as error:
+        raise FeatureValidationError(_describe_failures(error)) from error
+    logger.info("Candidate batch is valid: %d candidate(s)", len(validated))
+    return pd.DataFrame(validated)
+
+
+def build_candidate_features(candidates: pd.DataFrame) -> pd.DataFrame:
+    """Apply the model-independent transformations to a batch of new candidates.
+
+    What leaves here carries the dtypes and the ranges the model was fitted on, and no
+    gaps, exactly like the historical feature table. It differs in one invariant, on
+    purpose: rows are not unique. Deduplication protects training from counting one
+    record twice; here every applicant is a person waiting for their own answer.
+    """
+    renamed = _rename_to_canonical(candidates)
+    if BOOLEAN_COLUMN in renamed.columns:
+        renamed[BOOLEAN_COLUMN] = _normalize_research(renamed[BOOLEAN_COLUMN])
+    features = cast_dtypes(validate_candidate_data(renamed))[FEATURE_COLUMNS]
+    features = features.reset_index(drop=True)
+    try:
+        CANDIDATE_FEATURE_SCHEMA.validate(features, lazy=True)
+    except SchemaErrors as error:
+        raise FeatureValidationError(_describe_failures(error)) from error
+    logger.info("Candidate feature table shape: %s", features.shape)
+    return features
+
+
 def build_features(raw: pd.DataFrame) -> pd.DataFrame:
     """Apply the model-independent transformations and return the feature table."""
     features = drop_masked_duplicates(drop_exact_duplicates(cast_dtypes(raw)))
@@ -395,6 +540,20 @@ def run_pipeline(raw_path: Path, output_path: Path) -> pd.DataFrame:
     return features
 
 
+def run_candidate_pipeline(candidates_path: Path, output_path: Path) -> pd.DataFrame:
+    """Take a batch of undecided candidates into the feature store.
+
+    The second door of the store. Records arrive without a label because nobody has
+    decided them yet, and leave holding the dtypes, ranges and completeness the model
+    expects, so whoever reads them downstream does not have to check the data again.
+    The one invariant that differs from the historical table is uniqueness: repeated
+    applicants are kept.
+    """
+    features = build_candidate_features(load_raw_data(candidates_path))
+    save_features(features, output_path)
+    return features
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse the command line arguments of the standalone entry point."""
     project_root = find_project_root()
@@ -412,6 +571,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Parquet file of the feature layer to write.",
     )
     parser.add_argument(
+        "--candidates-path",
+        type=Path,
+        default=None,
+        help="CSV of undecided candidates. When given, that batch is processed instead "
+        "of the historical source.",
+    )
+    parser.add_argument(
+        "--candidates-output-path",
+        type=Path,
+        default=project_root / CANDIDATES_RELATIVE_PATH,
+        help="Parquet file where the undecided candidates are stored.",
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
@@ -427,6 +599,9 @@ def main(argv: list[str] | None = None) -> None:
         level=args.log_level,
         format="%(asctime)s | %(levelname)-8s | %(message)s",
     )
+    if args.candidates_path is not None:
+        run_candidate_pipeline(args.candidates_path, args.candidates_output_path)
+        return
     run_pipeline(args.raw_path, args.output_path)
 
 

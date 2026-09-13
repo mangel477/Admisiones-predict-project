@@ -14,6 +14,7 @@ from pipelines.feature_pipeline.feature_pipeline import (
     RAW_RELATIVE_PATH,
     TARGET_COLUMN,
     FeatureValidationError,
+    build_candidate_features,
     build_features,
     cast_dtypes,
     drop_exact_duplicates,
@@ -22,8 +23,10 @@ from pipelines.feature_pipeline.feature_pipeline import (
     load_raw_data,
     main,
     parse_args,
+    run_candidate_pipeline,
     run_pipeline,
     save_features,
+    validate_candidate_data,
     validate_feature_table,
     validate_raw_data,
 )
@@ -564,6 +567,169 @@ class TestIntegrityBetweenDatasets:
         raw = raw_frame(COMPLETE_ROW, COMPLETE_ROW, OTHER_ROW)
 
         validate_feature_table(build_features(raw), raw)
+
+
+def candidate_frame(*rows: dict[str, float | None]) -> pd.DataFrame:
+    """Build a batch of new candidates: the same columns, minus the label."""
+    return raw_frame(*rows).drop(columns=[TARGET_COLUMN])
+
+
+class TestValidateCandidateData:
+    """The contract for candidates that have not been decided yet."""
+
+    def test_accepts_a_batch_without_the_label(self) -> None:
+        validated = validate_candidate_data(candidate_frame(COMPLETE_ROW, OTHER_ROW))
+
+        assert list(validated.columns) == FEATURE_COLUMNS
+
+    def test_accepts_repeated_candidates(self) -> None:
+        """Two applicants with identical scores are two people, not a duplicate."""
+        validate_candidate_data(candidate_frame(COMPLETE_ROW, COMPLETE_ROW))
+
+    def test_rejects_a_batch_that_still_carries_the_label(self) -> None:
+        """A decided record belongs to the historical source, not to this door."""
+        with pytest.raises(FeatureValidationError, match="Chance of Admit"):
+            validate_candidate_data(raw_frame(COMPLETE_ROW))
+
+    def test_rejects_a_missing_predictor(self) -> None:
+        with pytest.raises(FeatureValidationError, match="CGPA"):
+            validate_candidate_data(candidate_frame(COMPLETE_ROW).drop(columns=["CGPA"]))
+
+    def test_rejects_a_score_above_its_documented_maximum(self) -> None:
+        with pytest.raises(FeatureValidationError, match="GRE Score"):
+            validate_candidate_data(candidate_frame({**COMPLETE_ROW, "GRE Score": 400.0}))
+
+    def test_rejects_a_value_off_the_half_point_grid(self) -> None:
+        with pytest.raises(FeatureValidationError, match="SOP"):
+            validate_candidate_data(candidate_frame({**COMPLETE_ROW, "SOP": 3.7}))
+
+    def test_rejects_a_candidate_with_no_observed_predictor(self) -> None:
+        empty: dict[str, float | None] = dict.fromkeys(COMPLETE_ROW)
+        padding = [COMPLETE_ROW] * (ROWS_UNDER_NULL_THRESHOLD - 1)
+
+        with pytest.raises(FeatureValidationError, match="predictor"):
+            validate_candidate_data(candidate_frame(empty, *padding))
+
+
+class TestBuildCandidateFeatures:
+    """The model-independent transformations, applied to undecided candidates."""
+
+    def test_types_the_columns_the_way_the_model_expects(self) -> None:
+        features = build_candidate_features(candidate_frame(COMPLETE_ROW, OTHER_ROW))
+
+        assert features["GRE Score"].dtype == "Int64"
+        assert features["Research"].dtype == "boolean"
+        assert list(features.columns) == FEATURE_COLUMNS
+
+    def test_accepts_whole_numbers_read_as_integers(self) -> None:
+        """A clean CSV has no gaps, so pandas types its whole numbers as int64."""
+        integral = candidate_frame(COMPLETE_ROW, OTHER_ROW).astype(
+            {"GRE Score": "int64", "TOEFL Score": "int64", "University Rating": "int64"}
+        )
+
+        features = build_candidate_features(integral)
+
+        assert features["GRE Score"].dtype == "Int64"
+
+    def test_keeps_every_candidate(self) -> None:
+        """Deduplication is a training concern: each applicant needs their own score."""
+        features = build_candidate_features(candidate_frame(COMPLETE_ROW, COMPLETE_ROW))
+
+        assert len(features) == TWO_ROWS
+
+    def test_recognizes_headers_regardless_of_case_and_spacing(self) -> None:
+        renamed = candidate_frame(COMPLETE_ROW).rename(
+            columns={"GRE Score": "gre score", LOR_COLUMN: "lor", "CGPA": " CGPA "}
+        )
+
+        features = build_candidate_features(renamed)
+
+        assert list(features.columns) == FEATURE_COLUMNS
+
+    def test_rejects_headers_that_collapse_to_the_same_column(self) -> None:
+        ambiguous = candidate_frame(COMPLETE_ROW).assign(**{" research ": 0.0})
+
+        with pytest.raises(FeatureValidationError, match="Research"):
+            build_candidate_features(ambiguous)
+
+    @pytest.mark.parametrize("spelling", ["yes", "Si", "TRUE", "1"])
+    def test_understands_the_affirmative_spellings(self, spelling: str) -> None:
+        batch = candidate_frame(COMPLETE_ROW).astype({"Research": "object"})
+        batch.loc[:, "Research"] = spelling
+
+        assert build_candidate_features(batch)["Research"].all()
+
+    @pytest.mark.parametrize("spelling", ["no", "False", "falso", "0"])
+    def test_understands_the_negative_spellings(self, spelling: str) -> None:
+        batch = candidate_frame(COMPLETE_ROW).astype({"Research": "object"})
+        batch.loc[:, "Research"] = spelling
+
+        assert not build_candidate_features(batch)["Research"].any()
+
+    def test_refuses_a_candidate_with_a_missing_predictor(self) -> None:
+        """The model would fill the hole with the cohort median and never say so."""
+        incomplete: dict[str, float | None] = {**COMPLETE_ROW, "CGPA": None}
+        padding = [COMPLETE_ROW] * (ROWS_UNDER_NULL_THRESHOLD - 1)
+
+        with pytest.raises(FeatureValidationError, match="CGPA"):
+            build_candidate_features(candidate_frame(incomplete, *padding))
+
+    def test_leaves_no_gap_in_the_stored_batch(self) -> None:
+        features = build_candidate_features(candidate_frame(COMPLETE_ROW, OTHER_ROW))
+
+        assert int(features.isna().sum().sum()) == 0
+
+    def test_refuses_to_guess_an_unrecognized_research_value(self) -> None:
+        """The model would score every unknown value as the majority class."""
+        batch = candidate_frame(COMPLETE_ROW).astype({"Research": "object"})
+        batch.loc[0, "Research"] = "banana"
+
+        with pytest.raises(FeatureValidationError, match="banana"):
+            build_candidate_features(batch)
+
+
+class TestRunCandidatePipeline:
+    """The second door of the feature store."""
+
+    def test_stores_the_prepared_candidates(self, tmp_path: Path) -> None:
+        source = write_raw_csv(tmp_path / "nuevos.csv", candidate_frame(COMPLETE_ROW, OTHER_ROW))
+        destination = tmp_path / "candidatos.parquet"
+
+        features = run_candidate_pipeline(source, destination)
+
+        assert len(features) == TWO_ROWS
+        assert destination.exists()
+        stored = pd.read_parquet(destination)
+        assert list(stored.columns) == FEATURE_COLUMNS
+        assert stored["Research"].dtype == "boolean"
+
+    def test_an_invalid_batch_stores_nothing(self, tmp_path: Path) -> None:
+        source = write_raw_csv(
+            tmp_path / "nuevos.csv", candidate_frame({**COMPLETE_ROW, "GRE Score": 400.0})
+        )
+        destination = tmp_path / "candidatos.parquet"
+
+        with pytest.raises(FeatureValidationError):
+            run_candidate_pipeline(source, destination)
+
+        assert not destination.exists()
+
+    def test_main_processes_a_candidate_batch(self, tmp_path: Path) -> None:
+        source = write_raw_csv(tmp_path / "nuevos.csv", candidate_frame(COMPLETE_ROW))
+        destination = tmp_path / "candidatos.parquet"
+
+        main(
+            [
+                "--candidates-path",
+                str(source),
+                "--candidates-output-path",
+                str(destination),
+                "--log-level",
+                "ERROR",
+            ]
+        )
+
+        assert destination.exists()
 
 
 class TestProjectRoot:

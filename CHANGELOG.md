@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- El pipeline de features acepta ahora lotes de candidatos que todavía no tienen respuesta de admisión, y los deja en la capa de features listos para ser puntuados. Aplica las mismas reglas que al archivo histórico salvo las dos que necesitan la respuesta: no hay probabilidad que acotar, ni registros que puedan contradecirse sobre una respuesta que nadie dio. Reconoce los nombres de columna sin distinguir mayúsculas ni espacios, acepta la variable de investigación escrita de varias formas y rechaza la ejecución completa cuando encuentra un valor que no puede interpretar. Se ejecuta con `--candidates-path`.
+- Los candidatos nuevos no se deduplican, a diferencia del archivo histórico: dos aspirantes con los mismos puntajes son dos personas, y cada una necesita su propia predicción.
+
 - El pipeline de entrenamiento valida el rendimiento del modelo con validación cruzada sobre el conjunto de entrenamiento, en diez particiones estratificadas por quintiles de la probabilidad de admisión. El informe compara los tres conjuntos de números —entrenamiento, validación cruzada y prueba— e incluye la dispersión entre particiones, que es lo que indica si un buen promedio esconde resultados que dependen de qué registros tocaron en cada una.
 - Diagnóstico automático de sobreajuste, subajuste y representatividad del conjunto de prueba. Cada veredicto va acompañado del número del que sale: la diferencia entre entrenamiento y validación cruzada, cuántas veces mejor es el modelo que predecir siempre el promedio, y a cuántas desviaciones está el error de prueba del promedio de la validación cruzada. Ese promedio de referencia se mide en cada ejecución en lugar de arrastrarse como constante. Cuando algún indicador se sale de rango, el informe y los registros incluyen la acción de mejora concreta que corresponde.
 
