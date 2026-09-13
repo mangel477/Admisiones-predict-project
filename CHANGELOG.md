@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- El pipeline de entrenamiento valida el rendimiento del modelo con validación cruzada sobre el conjunto de entrenamiento, en diez particiones estratificadas por quintiles de la probabilidad de admisión. El informe compara los tres conjuntos de números —entrenamiento, validación cruzada y prueba— e incluye la dispersión entre particiones, que es lo que indica si un buen promedio esconde resultados que dependen de qué registros tocaron en cada una.
+- Diagnóstico automático de sobreajuste, subajuste y representatividad del conjunto de prueba. Cada veredicto va acompañado del número del que sale: la diferencia entre entrenamiento y validación cruzada, cuántas veces mejor es el modelo que predecir siempre el promedio, y a cuántas desviaciones está el error de prueba del promedio de la validación cruzada. Ese promedio de referencia se mide en cada ejecución en lugar de arrastrarse como constante. Cuando algún indicador se sale de rango, el informe y los registros incluyen la acción de mejora concreta que corresponde.
+
 - El pipeline de entrenamiento verifica la separación entre entrenamiento y prueba antes de entrenar. Comprueba de forma exacta que ningún registro aparezca en ambos lados, ni por índice ni por contenido, y compara la distribución de cada columna entre las dos partes —incluida la variable a predecir— con la prueba estadística que corresponde a cada tipo de dato. Si detecta registros compartidos el proceso se detiene con un error que indica cuántos son y qué porcentaje del conjunto de prueba representan, y no se guarda ningún modelo; las diferencias de distribución se reportan como advertencia y quedan registradas en el informe de métricas junto con su valor y su umbral.
 - Evidently queda declarado como dependencia de ejecución: es la herramienta que aporta las pruebas estadísticas de distribución.
 

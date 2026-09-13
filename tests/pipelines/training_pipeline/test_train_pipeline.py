@@ -3,15 +3,20 @@
 import json
 import logging
 from pathlib import Path
+from typing import Any
 
 import joblib
 import numpy as np
 import pandas as pd
 import pytest
+from sklearn.linear_model import Ridge
 from sklearn.pipeline import Pipeline
 
+from pipelines.training_pipeline import train_pipeline
 from pipelines.training_pipeline.train_pipeline import (
     BINARY_COLUMNS,
+    CV_FOLDS,
+    MINIMUM_FOLDS,
     NUMERIC_COLUMNS,
     RANDOM_STATE,
     RIDGE_ALPHA,
@@ -20,6 +25,8 @@ from pipelines.training_pipeline.train_pipeline import (
     TrainTestSplitError,
     build_model,
     collect_metrics,
+    cross_validate_model,
+    diagnose_fit,
     evaluate_model,
     find_project_root,
     load_features,
@@ -34,7 +41,7 @@ from pipelines.training_pipeline.train_pipeline import (
     validate_train_test_split,
 )
 
-SYNTHETIC_ROWS = 60
+SYNTHETIC_ROWS = 100
 METRIC_NAMES = ("mae", "rmse", "r2")
 PERFECT_R2 = 1.0
 MINIMUM_LEARNED_R2 = 0.9
@@ -43,6 +50,8 @@ EXPECTED_TEST_ROWS = round(SYNTHETIC_ROWS * TEST_SIZE)
 # The split checks need enough records to say anything meaningful about a distribution.
 VALIDATION_ROWS = 300
 LEAKED_RECORDS = 40
+# Small enough that the smallest quantile bin cannot supply ten folds.
+SMALL_TRAINING_ROWS = 50
 
 
 def realistic_features(rows: int = VALIDATION_ROWS) -> pd.DataFrame:
@@ -346,17 +355,180 @@ class TestEvaluateModel:
         assert metrics["rmse"] >= metrics["mae"]
 
 
+class TestCrossValidateModel:
+    """Cross-validation over the training split."""
+
+    def test_reports_mean_and_spread_for_every_metric(self) -> None:
+        predictors, label = split_features_and_label(realistic_features())
+        x_train, _, y_train, _ = split_train_test(predictors, label)
+
+        result = cross_validate_model(x_train, y_train)
+
+        assert tuple(result["metrics"]) == METRIC_NAMES
+        for metric in METRIC_NAMES:
+            assert {"mean", "std"} <= set(result["metrics"][metric])
+            assert np.isfinite(result["metrics"][metric]["mean"])
+            assert result["metrics"][metric]["std"] >= 0
+
+    def test_records_how_the_folds_were_built(self) -> None:
+        predictors, label = split_features_and_label(realistic_features())
+        x_train, _, y_train, _ = split_train_test(predictors, label)
+
+        result = cross_validate_model(x_train, y_train)
+
+        assert result["folds"] == CV_FOLDS
+        assert result["strategy"] == "StratifiedKFold"
+        assert result["random_state"] == RANDOM_STATE
+
+    def test_is_reproducible(self) -> None:
+        predictors, label = split_features_and_label(realistic_features())
+        x_train, _, y_train, _ = split_train_test(predictors, label)
+
+        first = cross_validate_model(x_train, y_train)
+        second = cross_validate_model(x_train, y_train)
+
+        assert first["metrics"] == second["metrics"]
+
+    def test_reduces_the_folds_to_what_the_data_supports(self) -> None:
+        """Ten folds over a handful of records is not a measurement, it is noise."""
+        predictors, label = split_features_and_label(realistic_features(SMALL_TRAINING_ROWS))
+        x_train, _, y_train, _ = split_train_test(predictors, label)
+
+        result = cross_validate_model(x_train, y_train)
+
+        assert result["folds"] < CV_FOLDS
+        assert result["folds"] >= MINIMUM_FOLDS
+
+    def test_rejects_a_training_split_too_small_to_cross_validate(self) -> None:
+        predictors, label = split_features_and_label(realistic_features(VALIDATION_ROWS))
+        x_train, _, y_train, _ = split_train_test(predictors, label)
+
+        with pytest.raises(ValueError, match="too small"):
+            cross_validate_model(x_train.head(3), y_train.head(3))
+
+    def test_fails_loudly_when_a_fold_cannot_be_scored(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A fold that silently scores NaN would be averaged into a clean-looking report."""
+
+        class FailingRegressor(Ridge):
+            def fit(self, x: pd.DataFrame, y: pd.Series, **kwargs: Any) -> None:
+                raise RuntimeError("this fold cannot be fitted")
+
+        monkeypatch.setattr(
+            train_pipeline,
+            "build_model",
+            lambda: Pipeline([("model", FailingRegressor())]),
+        )
+        predictors, label = split_features_and_label(realistic_features())
+        x_train, _, y_train, _ = split_train_test(predictors, label)
+
+        with pytest.raises(RuntimeError, match="cannot be fitted"):
+            cross_validate_model(x_train, y_train)
+
+    def test_scores_a_learnable_signal_better_than_the_mean(self) -> None:
+        """The baseline is measured, never copied from a notebook constant."""
+        predictors, label = split_features_and_label(realistic_features())
+        x_train, _, y_train, _ = split_train_test(predictors, label)
+
+        result = cross_validate_model(x_train, y_train)
+
+        assert result["baseline"]["mae"]["mean"] > result["metrics"]["mae"]["mean"]
+
+
+class TestDiagnoseFit:
+    """Reading underfitting, overfitting and test representativeness off the numbers."""
+
+    def sound_numbers(self) -> tuple[dict[str, float], dict[str, Any], dict[str, float]]:
+        train = {"mae": 0.044, "rmse": 0.061, "r2": 0.816}
+        cross_validation = {
+            "metrics": {
+                "mae": {"mean": 0.046, "std": 0.007},
+                "rmse": {"mean": 0.062, "std": 0.009},
+                "r2": {"mean": 0.790, "std": 0.060},
+            },
+            "baseline": {"mae": {"mean": 0.114, "std": 0.011}},
+        }
+        test = {"mae": 0.047, "rmse": 0.072, "r2": 0.750}
+        return train, cross_validation, test
+
+    def test_clears_a_model_that_generalizes(self) -> None:
+        diagnosis = diagnose_fit(*self.sound_numbers())
+
+        assert diagnosis["overfitting"] is False
+        assert diagnosis["underfitting"] is False
+        assert diagnosis["test_is_representative"] is True
+        assert diagnosis["actions"] == []
+
+    def test_flags_a_model_that_memorized_the_training_split(self) -> None:
+        train, cross_validation, test = self.sound_numbers()
+        train["mae"] = 0.005
+
+        diagnosis = diagnose_fit(train, cross_validation, test)
+
+        assert diagnosis["overfitting"] is True
+        assert any("regulariz" in action.lower() for action in diagnosis["actions"])
+
+    def test_flags_a_model_that_barely_beats_the_mean(self) -> None:
+        train, cross_validation, test = self.sound_numbers()
+        cross_validation["metrics"]["mae"]["mean"] = 0.112
+
+        diagnosis = diagnose_fit(train, cross_validation, test)
+
+        assert diagnosis["underfitting"] is True
+        assert diagnosis["actions"]
+
+    def test_flags_a_test_split_outside_the_cross_validated_range(self) -> None:
+        train, cross_validation, test = self.sound_numbers()
+        test["mae"] = 0.090
+
+        diagnosis = diagnose_fit(train, cross_validation, test)
+
+        assert diagnosis["test_is_representative"] is False
+        assert any("test" in action.lower() for action in diagnosis["actions"])
+
+    def test_reports_a_perfect_training_fit_as_overfitting(self) -> None:
+        """Zero training error against positive fold error is memorization, not skill."""
+        train, cross_validation, test = self.sound_numbers()
+        train["mae"] = 0.0
+
+        diagnosis = diagnose_fit(train, cross_validation, test)
+
+        assert diagnosis["overfitting"] is True
+        assert diagnosis["generalization_gap_ratio"] == float("inf")
+
+    def test_does_not_report_a_flawless_model_as_underfitting(self) -> None:
+        """A model with no cross-validated error beats the mean by definition."""
+        train, cross_validation, test = self.sound_numbers()
+        train["mae"] = 0.0
+        cross_validation["metrics"]["mae"] = {"mean": 0.0, "std": 0.0}
+        test["mae"] = 0.0
+
+        diagnosis = diagnose_fit(train, cross_validation, test)
+
+        assert diagnosis["underfitting"] is False
+        assert diagnosis["baseline_improvement"] == float("inf")
+
+    def test_quantifies_every_gap_it_judges(self) -> None:
+        """A verdict without its number is an opinion."""
+        diagnosis = diagnose_fit(*self.sound_numbers())
+
+        assert diagnosis["generalization_gap"] == pytest.approx(0.002, abs=1e-9)
+        assert diagnosis["baseline_improvement"] > 1
+        assert "test_distance_in_std" in diagnosis
+
+
 class TestCollectMetrics:
     """The evaluation report that gets stored next to the model."""
 
-    def test_reports_both_sides_of_the_split(self) -> None:
+    def test_reports_the_three_sets_of_numbers(self) -> None:
         predictors, label = split_features_and_label(synthetic_features())
         splits = split_train_test(predictors, label)
         model = train_model(splits[0], splits[2])
 
         report = collect_metrics(model, *splits)
 
-        assert tuple(report["metrics"]) == ("train", "test")
+        assert tuple(report["metrics"]) == ("train", "cross_validation", "test")
         assert tuple(report["metrics"]["test"]) == METRIC_NAMES
 
     def test_records_how_the_model_and_the_split_were_configured(self) -> None:
@@ -370,6 +542,16 @@ class TestCollectMetrics:
         assert report["split"]["random_state"] == RANDOM_STATE
         assert report["split"]["test_rows"] == EXPECTED_TEST_ROWS
         assert report["split"]["train_rows"] == SYNTHETIC_ROWS - EXPECTED_TEST_ROWS
+
+    def test_compares_train_cross_validation_and_test(self) -> None:
+        predictors, label = split_features_and_label(realistic_features())
+        splits = split_train_test(predictors, label)
+        model = train_model(splits[0], splits[2])
+
+        report = collect_metrics(model, *splits)
+
+        assert tuple(report["metrics"]) == ("train", "cross_validation", "test")
+        assert report["diagnosis"]["overfitting"] is False
 
 
 class TestSaveMetrics:
