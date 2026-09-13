@@ -262,13 +262,26 @@ def convertir_research(valores: pd.Series) -> pd.Series:
     A spreadsheet may hold 1/0, True/False or si/no depending on who filled it in.
     """
     if valores.dtype == bool:
-        return valores
-    texto = valores.astype(str).str.strip().str.lower()
-    convertido = texto.map(
-        lambda valor: (
-            True if valor in VALORES_VERDADEROS else (False if valor in VALORES_FALSOS else None)
+        return valores.astype("boolean")
+
+    # Numbers first: a spreadsheet with a single gap makes pandas read the whole column
+    # as float, and then 1 arrives as "1.0", which no list of spellings will ever match.
+    numerico = pd.to_numeric(valores, errors="coerce")
+    convertido = pd.Series(pd.NA, index=valores.index, dtype="boolean")
+    convertido[numerico == 1] = True
+    convertido[numerico == 0] = False
+
+    # Whatever was not a number gets read as one of the usual spellings.
+    pendientes = convertido.isna() & valores.notna()
+    if pendientes.any():
+        texto = valores[pendientes].astype(str).str.strip().str.lower()
+        convertido[pendientes] = texto.map(
+            lambda valor: (
+                True
+                if valor in VALORES_VERDADEROS
+                else (False if valor in VALORES_FALSOS else pd.NA)
+            )
         )
-    )
     return convertido.astype("boolean")
 
 
