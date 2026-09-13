@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-09-13
+
 ### Added
 
 - Un pipeline de inferencia ejecutable por sí solo, `src/pipelines/inference_pipeline/inference_pipeline.py`, que carga el modelo entrenado, lee del almacén de features el lote de candidatos pendientes y guarda cada uno junto a su probabilidad estimada de admisión. Acota las probabilidades al rango válido, porque una regresión lineal puede devolver valores por fuera para candidatos en los extremos, y avisa cuántas acotó.
