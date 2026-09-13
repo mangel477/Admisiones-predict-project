@@ -31,10 +31,11 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
+from sklearn.dummy import DummyRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold, cross_validate, train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OrdinalEncoder, StandardScaler
 
@@ -57,6 +58,18 @@ RANDOM_STATE = 42
 TEST_SIZE = 0.2
 STRATIFICATION_BINS = 5
 RIDGE_ALPHA = 10.0
+
+# Cross-validation over the training split. The target is continuous, so the folds
+# are stratified on its quantiles: with 320 records and ten folds, a blind split can
+# hand a fold a skewed slice of the range. The bins only assign folds — every model
+# is still fitted on the continuous target.
+CV_FOLDS = 10
+
+# Thresholds that turn the three sets of numbers into a verdict. They are deliberately
+# loose: their job is to catch a model that is clearly broken, not to grade a good one.
+OVERFITTING_GAP_RATIO = 0.25
+UNDERFITTING_IMPROVEMENT = 1.2
+TEST_REPRESENTATIVE_STD = 2.0
 
 # Checks that make training unsound when they fail: a record shared by both sides
 # turns the test metrics into a memory test, so the run aborts. Drift between the
@@ -363,6 +376,144 @@ def evaluate_model(model: Any, predictors: pd.DataFrame, label: pd.Series) -> di
     }
 
 
+def _summarize_scores(scores: dict[str, np.ndarray]) -> dict[str, dict[str, float]]:
+    """Turn the raw fold scores into a mean and a spread per metric.
+
+    The spread matters as much as the mean: a good average over folds that disagree
+    wildly describes a model whose quality depends on which records it happened to
+    see, and that is not a model anyone can trust in production.
+    """
+    return {
+        "mae": {
+            "mean": float(-scores["test_neg_mean_absolute_error"].mean()),
+            "std": float(scores["test_neg_mean_absolute_error"].std()),
+        },
+        "rmse": {
+            "mean": float(-scores["test_neg_root_mean_squared_error"].mean()),
+            "std": float(scores["test_neg_root_mean_squared_error"].std()),
+        },
+        "r2": {
+            "mean": float(scores["test_r2"].mean()),
+            "std": float(scores["test_r2"].std()),
+        },
+    }
+
+
+def cross_validate_model(x_train: pd.DataFrame, y_train: pd.Series) -> dict[str, Any]:
+    """Cross-validate the architecture over the training split, with a measured floor.
+
+    A single held-out test set gives one number with no sense of its own uncertainty.
+    Cross-validation gives a distribution instead, and the spread across folds is what
+    says whether the held-out number was luck.
+
+    The same folds also score a regressor that always predicts the training mean. That
+    floor is what makes underfitting measurable rather than a matter of opinion, and
+    computing it here keeps it honest: it is never a constant copied from a notebook.
+    """
+    folds = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+    bins = pd.qcut(y_train, q=STRATIFICATION_BINS, labels=False, duplicates="drop")
+    scoring = ["neg_mean_absolute_error", "neg_root_mean_squared_error", "r2"]
+
+    logger.info("Cross-validating over %d stratified folds of the training split", CV_FOLDS)
+    model_scores = cross_validate(
+        build_model(), x_train, y_train, cv=list(folds.split(x_train, bins)), scoring=scoring
+    )
+    baseline = Pipeline(
+        steps=[
+            ("preprocessor", build_preprocessor()),
+            ("model", DummyRegressor(strategy="mean")),
+        ]
+    )
+    baseline_scores = cross_validate(
+        baseline, x_train, y_train, cv=list(folds.split(x_train, bins)), scoring=scoring
+    )
+
+    metrics = _summarize_scores(model_scores)
+    logger.info(
+        "Cross-validation — MAE: %.4f ± %.4f | RMSE: %.4f ± %.4f | R2: %.4f ± %.4f",
+        metrics["mae"]["mean"],
+        metrics["mae"]["std"],
+        metrics["rmse"]["mean"],
+        metrics["rmse"]["std"],
+        metrics["r2"]["mean"],
+        metrics["r2"]["std"],
+    )
+    return {
+        "strategy": type(folds).__name__,
+        "folds": CV_FOLDS,
+        "random_state": RANDOM_STATE,
+        "stratification_bins": STRATIFICATION_BINS,
+        "metrics": metrics,
+        "baseline": _summarize_scores(baseline_scores),
+    }
+
+
+def diagnose_fit(
+    train: dict[str, float],
+    cross_validation: dict[str, Any],
+    test: dict[str, float],
+) -> dict[str, Any]:
+    """Read underfitting, overfitting and test representativeness off the three sets.
+
+    Every verdict carries the number it came from. A diagnosis without its measurement
+    is an opinion, and an opinion cannot be re-checked on the next run.
+    """
+    cv_mae = cross_validation["metrics"]["mae"]
+    baseline_mae = cross_validation["baseline"]["mae"]["mean"]
+
+    generalization_gap = cv_mae["mean"] - train["mae"]
+    gap_ratio = generalization_gap / train["mae"] if train["mae"] else 0.0
+    baseline_improvement = baseline_mae / cv_mae["mean"] if cv_mae["mean"] else 0.0
+    spread = cv_mae["std"] or 1e-12
+    test_distance = abs(test["mae"] - cv_mae["mean"]) / spread
+
+    overfitting = gap_ratio > OVERFITTING_GAP_RATIO
+    underfitting = baseline_improvement < UNDERFITTING_IMPROVEMENT
+    representative = test_distance <= TEST_REPRESENTATIVE_STD
+
+    actions: list[str] = []
+    if overfitting:
+        actions.append(
+            f"The model fits training {gap_ratio:.0%} better than unseen folds: raise the "
+            "regularization strength, drop the least informative features, or gather more "
+            "records."
+        )
+    if underfitting:
+        actions.append(
+            f"Cross-validated error is only {baseline_improvement:.2f}x better than "
+            "predicting the mean: the architecture is too simple for this signal. Try a "
+            "model family that captures interactions, or engineer features that carry more."
+        )
+    if not representative:
+        actions.append(
+            f"Test error sits {test_distance:.1f} standard deviations from the "
+            "cross-validated mean: the held-out set is not representative. Re-draw the "
+            "split with another seed and confirm the numbers move together."
+        )
+
+    diagnosis = {
+        "overfitting": overfitting,
+        "underfitting": underfitting,
+        "test_is_representative": representative,
+        "generalization_gap": generalization_gap,
+        "generalization_gap_ratio": gap_ratio,
+        "baseline_improvement": baseline_improvement,
+        "test_distance_in_std": test_distance,
+        "actions": actions,
+    }
+    logger.info(
+        "Fit diagnosis — gap train/CV: %.4f (%.1f%%) | vs mean baseline: %.2fx | "
+        "test at %.1f sigma of CV",
+        generalization_gap,
+        gap_ratio * 100,
+        baseline_improvement,
+        test_distance,
+    )
+    for action in actions:
+        logger.warning("Fit diagnosis: %s", action)
+    return diagnosis
+
+
 def collect_metrics(
     model: Pipeline,
     x_train: pd.DataFrame,
@@ -375,6 +526,9 @@ def collect_metrics(
     Both sides of the split are scored: the gap between them is what exposes
     overfitting, and a report with test alone cannot show it.
     """
+    train_metrics = evaluate_model(model, x_train, y_train)
+    test_metrics = evaluate_model(model, x_test, y_test)
+    cross_validation = cross_validate_model(x_train, y_train)
     report: dict[str, Any] = {
         "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
         "model": {
@@ -390,9 +544,11 @@ def collect_metrics(
             "test_rows": len(x_test),
         },
         "metrics": {
-            "train": evaluate_model(model, x_train, y_train),
-            "test": evaluate_model(model, x_test, y_test),
+            "train": train_metrics,
+            "cross_validation": cross_validation,
+            "test": test_metrics,
         },
+        "diagnosis": diagnose_fit(train_metrics, cross_validation, test_metrics),
     }
     test = report["metrics"]["test"]
     logger.info(

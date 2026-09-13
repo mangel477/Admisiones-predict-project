@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-09-13T14:27:00+00:00",
+  "generated_at": "2026-09-13T15:05:45+00:00",
   "model": {
     "family": "Ridge",
     "alpha": 10.0,
@@ -18,11 +18,55 @@
       "rmse": 0.060932843506706004,
       "r2": 0.815822739031035
     },
+    "cross_validation": {
+      "strategy": "StratifiedKFold",
+      "folds": 10,
+      "random_state": 42,
+      "stratification_bins": 5,
+      "metrics": {
+        "mae": {
+          "mean": 0.04521268554038674,
+          "std": 0.005200528117773296
+        },
+        "rmse": {
+          "mean": 0.061898668915352784,
+          "std": 0.007448230286351292
+        },
+        "r2": {
+          "mean": 0.8043028696945577,
+          "std": 0.047487180928396155
+        }
+      },
+      "baseline": {
+        "mae": {
+          "mean": 0.11363541666666666,
+          "std": 0.007803658903208228
+        },
+        "rmse": {
+          "mean": 0.14170198936135187,
+          "std": 0.009578793792050738
+        },
+        "r2": {
+          "mean": -0.00312368518818138,
+          "std": 0.0026649571945513663
+        }
+      }
+    },
     "test": {
       "mae": 0.04668175103128999,
       "rmse": 0.07215687670278048,
       "r2": 0.7496488787940586
     }
+  },
+  "diagnosis": {
+    "overfitting": false,
+    "underfitting": false,
+    "test_is_representative": true,
+    "generalization_gap": 0.0009287459713800683,
+    "generalization_gap_ratio": 0.02097252368283143,
+    "baseline_improvement": 2.5133525095553226,
+    "test_distance_in_std": 0.28248390502545,
+    "actions": []
   },
   "split_validation": {
     "passed": true,
