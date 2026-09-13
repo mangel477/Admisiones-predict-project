@@ -9,11 +9,14 @@ import joblib
 import numpy as np
 import pandas as pd
 import pytest
+from sklearn.linear_model import Ridge
 from sklearn.pipeline import Pipeline
 
+from pipelines.training_pipeline import train_pipeline
 from pipelines.training_pipeline.train_pipeline import (
     BINARY_COLUMNS,
     CV_FOLDS,
+    MINIMUM_FOLDS,
     NUMERIC_COLUMNS,
     RANDOM_STATE,
     RIDGE_ALPHA,
@@ -47,6 +50,8 @@ EXPECTED_TEST_ROWS = round(SYNTHETIC_ROWS * TEST_SIZE)
 # The split checks need enough records to say anything meaningful about a distribution.
 VALIDATION_ROWS = 300
 LEAKED_RECORDS = 40
+# Small enough that the smallest quantile bin cannot supply ten folds.
+SMALL_TRAINING_ROWS = 50
 
 
 def realistic_features(rows: int = VALIDATION_ROWS) -> pd.DataFrame:
@@ -384,6 +389,43 @@ class TestCrossValidateModel:
 
         assert first["metrics"] == second["metrics"]
 
+    def test_reduces_the_folds_to_what_the_data_supports(self) -> None:
+        """Ten folds over a handful of records is not a measurement, it is noise."""
+        predictors, label = split_features_and_label(realistic_features(SMALL_TRAINING_ROWS))
+        x_train, _, y_train, _ = split_train_test(predictors, label)
+
+        result = cross_validate_model(x_train, y_train)
+
+        assert result["folds"] < CV_FOLDS
+        assert result["folds"] >= MINIMUM_FOLDS
+
+    def test_rejects_a_training_split_too_small_to_cross_validate(self) -> None:
+        predictors, label = split_features_and_label(realistic_features(VALIDATION_ROWS))
+        x_train, _, y_train, _ = split_train_test(predictors, label)
+
+        with pytest.raises(ValueError, match="too small"):
+            cross_validate_model(x_train.head(3), y_train.head(3))
+
+    def test_fails_loudly_when_a_fold_cannot_be_scored(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A fold that silently scores NaN would be averaged into a clean-looking report."""
+
+        class FailingRegressor(Ridge):
+            def fit(self, x: pd.DataFrame, y: pd.Series, **kwargs: Any) -> None:
+                raise RuntimeError("this fold cannot be fitted")
+
+        monkeypatch.setattr(
+            train_pipeline,
+            "build_model",
+            lambda: Pipeline([("model", FailingRegressor())]),
+        )
+        predictors, label = split_features_and_label(realistic_features())
+        x_train, _, y_train, _ = split_train_test(predictors, label)
+
+        with pytest.raises(RuntimeError, match="cannot be fitted"):
+            cross_validate_model(x_train, y_train)
+
     def test_scores_a_learnable_signal_better_than_the_mean(self) -> None:
         """The baseline is measured, never copied from a notebook constant."""
         predictors, label = split_features_and_label(realistic_features())
@@ -444,6 +486,28 @@ class TestDiagnoseFit:
 
         assert diagnosis["test_is_representative"] is False
         assert any("test" in action.lower() for action in diagnosis["actions"])
+
+    def test_reports_a_perfect_training_fit_as_overfitting(self) -> None:
+        """Zero training error against positive fold error is memorization, not skill."""
+        train, cross_validation, test = self.sound_numbers()
+        train["mae"] = 0.0
+
+        diagnosis = diagnose_fit(train, cross_validation, test)
+
+        assert diagnosis["overfitting"] is True
+        assert diagnosis["generalization_gap_ratio"] == float("inf")
+
+    def test_does_not_report_a_flawless_model_as_underfitting(self) -> None:
+        """A model with no cross-validated error beats the mean by definition."""
+        train, cross_validation, test = self.sound_numbers()
+        train["mae"] = 0.0
+        cross_validation["metrics"]["mae"] = {"mean": 0.0, "std": 0.0}
+        test["mae"] = 0.0
+
+        diagnosis = diagnose_fit(train, cross_validation, test)
+
+        assert diagnosis["underfitting"] is False
+        assert diagnosis["baseline_improvement"] == float("inf")
 
     def test_quantifies_every_gap_it_judges(self) -> None:
         """A verdict without its number is an opinion."""

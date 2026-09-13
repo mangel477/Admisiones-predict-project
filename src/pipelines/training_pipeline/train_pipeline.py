@@ -64,6 +64,7 @@ RIDGE_ALPHA = 10.0
 # hand a fold a skewed slice of the range. The bins only assign folds — every model
 # is still fitted on the continuous target.
 CV_FOLDS = 10
+MINIMUM_FOLDS = 2
 
 # Thresholds that turn the three sets of numbers into a verdict. They are deliberately
 # loose: their job is to catch a model that is clearly broken, not to grade a good one.
@@ -399,6 +400,31 @@ def _summarize_scores(scores: dict[str, np.ndarray]) -> dict[str, dict[str, floa
     }
 
 
+def _usable_folds(bins: pd.Series) -> int:
+    """Cap the fold count at what the smallest stratification bin can actually supply.
+
+    ``StratifiedKFold`` raises only when *every* bin falls below ``n_splits``; when just
+    one does, it warns and hands back folds missing that bin. Both outcomes are wrong
+    for a report: one crashes with a message that says nothing about what to do, the
+    other quietly degrades the numbers. The fold count is capped here instead, and the
+    report records the number actually used so the metrics stay interpretable.
+    """
+    smallest_bin = int(bins.value_counts().min())
+    folds = min(CV_FOLDS, smallest_bin)
+    if folds < MINIMUM_FOLDS:
+        raise ValueError(
+            f"The training split is too small to cross-validate: its smallest quantile "
+            f"bin holds {smallest_bin} record(s) and at least {MINIMUM_FOLDS} are needed."
+        )
+    if folds < CV_FOLDS:
+        logger.warning(
+            "Reduced cross-validation to %d folds: the smallest quantile bin holds %d records",
+            folds,
+            smallest_bin,
+        )
+    return folds
+
+
 def cross_validate_model(x_train: pd.DataFrame, y_train: pd.Series) -> dict[str, Any]:
     """Cross-validate the architecture over the training split, with a measured floor.
 
@@ -410,13 +436,17 @@ def cross_validate_model(x_train: pd.DataFrame, y_train: pd.Series) -> dict[str,
     floor is what makes underfitting measurable rather than a matter of opinion, and
     computing it here keeps it honest: it is never a constant copied from a notebook.
     """
-    folds = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
     bins = pd.qcut(y_train, q=STRATIFICATION_BINS, labels=False, duplicates="drop")
+    effective_folds = _usable_folds(bins)
+    folds = StratifiedKFold(n_splits=effective_folds, shuffle=True, random_state=RANDOM_STATE)
+    splits = list(folds.split(x_train, bins))
     scoring = ["neg_mean_absolute_error", "neg_root_mean_squared_error", "r2"]
 
-    logger.info("Cross-validating over %d stratified folds of the training split", CV_FOLDS)
+    logger.info("Cross-validating over %d stratified folds of the training split", effective_folds)
+    # error_score defaults to NaN, which would average a failed fold into a report that
+    # still looks clean. A validation report that hides its own failure is worthless.
     model_scores = cross_validate(
-        build_model(), x_train, y_train, cv=list(folds.split(x_train, bins)), scoring=scoring
+        build_model(), x_train, y_train, cv=splits, scoring=scoring, error_score="raise"
     )
     baseline = Pipeline(
         steps=[
@@ -425,7 +455,7 @@ def cross_validate_model(x_train: pd.DataFrame, y_train: pd.Series) -> dict[str,
         ]
     )
     baseline_scores = cross_validate(
-        baseline, x_train, y_train, cv=list(folds.split(x_train, bins)), scoring=scoring
+        baseline, x_train, y_train, cv=splits, scoring=scoring, error_score="raise"
     )
 
     metrics = _summarize_scores(model_scores)
@@ -440,12 +470,19 @@ def cross_validate_model(x_train: pd.DataFrame, y_train: pd.Series) -> dict[str,
     )
     return {
         "strategy": type(folds).__name__,
-        "folds": CV_FOLDS,
+        "folds": effective_folds,
         "random_state": RANDOM_STATE,
         "stratification_bins": STRATIFICATION_BINS,
         "metrics": metrics,
         "baseline": _summarize_scores(baseline_scores),
     }
+
+
+def _ratio(numerator: float, denominator: float) -> float:
+    """Divide, treating a zero denominator under a positive numerator as unbounded."""
+    if denominator:
+        return numerator / denominator
+    return float("inf") if numerator > 0 else 0.0
 
 
 def diagnose_fit(
@@ -462,8 +499,11 @@ def diagnose_fit(
     baseline_mae = cross_validation["baseline"]["mae"]["mean"]
 
     generalization_gap = cv_mae["mean"] - train["mae"]
-    gap_ratio = generalization_gap / train["mae"] if train["mae"] else 0.0
-    baseline_improvement = baseline_mae / cv_mae["mean"] if cv_mae["mean"] else 0.0
+    # Zero denominators are not "no signal": zero training error against positive fold
+    # error is the purest case of memorization, and zero fold error beats any baseline.
+    # Collapsing either to 0.0 would report the exact opposite verdict.
+    gap_ratio = _ratio(generalization_gap, train["mae"])
+    baseline_improvement = _ratio(baseline_mae, cv_mae["mean"])
     spread = cv_mae["std"] or 1e-12
     test_distance = abs(test["mae"] - cv_mae["mean"]) / spread
 
